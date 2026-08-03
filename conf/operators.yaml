@@ -3610,7 +3610,7 @@ ops:
     kind:
       - NeuralNetwork
     stages:
-      - alpha: '5.1'
+      - alpha: '5.4'
   - id: fused_deepseek_v4_qnorm_rope_kv_rope_insert
     description: |
       Horizontally-fused DeepseekV4-MLA BF16 variant.
