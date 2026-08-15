@@ -103,6 +103,7 @@ _FULL_CONFIG = (
     ("_cdist_forward", _cdist_forward),
     ("_chunk_cat", _chunk_cat),
     ("_conj", _conj),
+    ("_cummin_helper", _cummin_helper),
     ("_conv_depthwise2d", _conv_depthwise2d),
     ("_convert_weight_to_int4pack", _convert_weight_to_int4pack),
     ("_cudnn_attention_forward", cudnn_attention_forward),
