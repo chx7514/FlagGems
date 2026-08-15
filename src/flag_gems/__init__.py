@@ -468,6 +468,10 @@ _FULL_CONFIG = (
     ("eye.m", eye_m),
     ("feature_dropout", feature_dropout),
     ("feature_dropout_", feature_dropout_),
+    (
+        "_fake_quantize_learnable_per_tensor_affine",
+        _fake_quantize_learnable_per_tensor_affine,
+    ),
     ("fill.Scalar", fill_scalar),
     ("fill.Scalar_out", fill_scalar_out),
     ("fill.Tensor", fill_tensor),
