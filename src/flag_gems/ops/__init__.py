@@ -38,6 +38,9 @@ from flag_gems.ops._embedding_bag_per_sample_weights_backward import (
 )
 from flag_gems.ops._euclidean_dist import _euclidean_dist
 from flag_gems.ops._flash_attention_forward import _flash_attention_forward
+from flag_gems.ops._flash_attention_forward_no_dropout_inplace import (
+    _flash_attention_forward_no_dropout_inplace,
+)
 from flag_gems.ops._functional_sym_constrain_range import (
     _functional_sym_constrain_range,
 )
@@ -815,6 +818,7 @@ __all__ = [
     "_amp_foreach_non_finite_check_and_unscale_",
     "_assert_async",
     "_batch_norm_no_update",
+    "_flash_attention_forward_no_dropout_inplace",
     "_functional_assert_async",
     "_cdist_backward",
     "_cdist_forward",

@@ -117,6 +117,10 @@ _FULL_CONFIG = (
     ("_flash_attention_backward", flash_attention_backward),
     ("_flash_attention_forward", _flash_attention_forward),
     (
+        "_flash_attention_forward_no_dropout_inplace",
+        _flash_attention_forward_no_dropout_inplace,
+    ),
+    (
         "_functional_sym_constrain_range",
         _functional_sym_constrain_range,
     ),
