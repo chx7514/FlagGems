@@ -80,6 +80,10 @@ def gems_cudnn_attention(
 
 
 @pytest.mark.scaled_dot_product_cudnn_attention
+@pytest.mark.skipif(
+    flag_gems.device != "cuda",
+    reason="_scaled_dot_product_cudnn_attention is a CUDA-only operator (cuDNN)",
+)
 @pytest.mark.parametrize("is_causal", [True, False])
 def test_scaled_dot_product_cudnn_attention(is_causal):
     """Benchmark for _scaled_dot_product_cudnn_attention."""

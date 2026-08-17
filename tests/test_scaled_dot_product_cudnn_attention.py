@@ -5,10 +5,12 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-TO_CPU = flag_gems.device == "cpu"
-
 
 @pytest.mark.scaled_dot_product_cudnn_attention
+@pytest.mark.skipif(
+    flag_gems.device != "cuda",
+    reason="_scaled_dot_product_cudnn_attention is a CUDA-only operator (cuDNN)",
+)
 @pytest.mark.parametrize(
     "batch, num_head, q_seq_len, kv_seq_len, head_size",
     [
@@ -25,9 +27,6 @@ def test_scaled_dot_product_cudnn_attention(
     batch, num_head, q_seq_len, kv_seq_len, head_size, dtype, is_causal
 ):
     """Test _scaled_dot_product_cudnn_attention accuracy against reference implementation."""
-    if TO_CPU:
-        pytest.skip("Skipping attention test in CPU mode.")
-
     utils.init_seed(42)
 
     # Create input tensors in the format expected by scaled_dot_product_cudnn_attention
@@ -96,6 +95,10 @@ def test_scaled_dot_product_cudnn_attention(
 
 
 @pytest.mark.scaled_dot_product_cudnn_attention
+@pytest.mark.skipif(
+    flag_gems.device != "cuda",
+    reason="_scaled_dot_product_cudnn_attention is a CUDA-only operator (cuDNN)",
+)
 @pytest.mark.parametrize(
     "batch, num_head, q_seq_len, kv_seq_len, head_size",
     [
@@ -108,9 +111,6 @@ def test_scaled_dot_product_cudnn_attention_with_attn_bias(
     batch, num_head, q_seq_len, kv_seq_len, head_size, dtype
 ):
     """Test _scaled_dot_product_cudnn_attention with attention bias."""
-    if TO_CPU:
-        pytest.skip("Skipping attention test in CPU mode.")
-
     utils.init_seed(42)
 
     q = torch.randn(
