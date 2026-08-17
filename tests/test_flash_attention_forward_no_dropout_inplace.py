@@ -19,6 +19,7 @@ import torch
 import flag_gems
 
 from . import accuracy_utils as utils
+from . import conftest as cfg
 
 device = flag_gems.device
 
@@ -94,6 +95,8 @@ def gems_impl(q, k, v, scale, is_causal):
     return out, lse, seed, offset, debug_softmax
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(cfg.TO_CPU, reason="Unsupported in CPU mode")
 @pytest.mark.flash_attention_forward_no_dropout_inplace
 @pytest.mark.parametrize(
     ["batch", "num_head", "q_seq_len", "kv_seq_len"],
