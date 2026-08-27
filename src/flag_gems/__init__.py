@@ -162,6 +162,7 @@ _FULL_CONFIG = (
     ("_linalg_eigvals", _linalg_eigvals),
     ("_list_to_tensor", _list_to_tensor),
     ("_nested_sum_backward", _nested_sum_backward),
+    ("_nested_view_from_jagged_copy", _nested_view_from_jagged_copy),
     ("_scaled_dot_product_cudnn_attention", _scaled_dot_product_cudnn_attention),
     (
         "_weight_int4pack_mm_with_scales_and_zeros",
