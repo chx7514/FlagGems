@@ -38,21 +38,27 @@ def _nested_from_padded_remove_padding_kernel(
 ):
     """Compacts a padded dense tensor into a flat buffer by removing the padding.
 
-    Each program handles one batch element and copies the leading
-    ``length * INNER_NUMEL`` contiguous elements of its row (which hold the real,
-    non-padded values) into the destination buffer starting at
-    ``row_offsets[pid] * INNER_NUMEL``.
+    The grid is ``(batch_size, num_chunks)``: program ``pid`` along axis 0 owns
+    batch element ``pid``, and the axis-1 programs tile its contiguous
+    ``length * INNER_NUMEL`` real elements in ``BLOCK_SIZE``-sized chunks. Tiling
+    the copy along the chunk axis (instead of a single program looping over the
+    whole component) keeps the memory-bound un-pad copy parallel across chunks,
+    which is essential when a component is large -- a single program per batch
+    serializes the copy and underutilizes the device.
     """
-    pid = tle.program_id(axis=0)
-    length = tl.load(lengths + pid)
+    b = tle.program_id(axis=0)
+    chunk = tle.program_id(axis=1)
+    length = tl.load(lengths + b)
     numel = length * INNER_NUMEL
-    dst = tl.load(row_offsets + pid) * INNER_NUMEL
-    src = pid * L * INNER_NUMEL
-    for start in tl.range(0, numel, BLOCK_SIZE):
-        offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < numel
-        v = tl.load(padded + src + offs, mask=mask)
-        tl.store(values + dst + offs, v, mask=mask)
+
+    idx = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < numel
+
+    dst = tl.load(row_offsets + b) * INNER_NUMEL + idx
+    src = b * L * INNER_NUMEL + idx
+
+    v = tl.load(padded + src, mask=mask)
+    tl.store(values + dst, v, mask=mask)
 
 
 def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=False):
@@ -83,8 +89,10 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     for d in inner_dims:
         inner_numel *= d
 
-    # Compute all small metadata on CPU (cheap, and not intercepted by FlagGems)
-    # so only a couple of tiny H2D copies touch the device.
+    # All components share the same inner shape, so their ``nested_strides`` row
+    # is identical across the batch; only ``lengths`` differ. Compute the host
+    # metadata vectorized (no per-dim Python loop over per-element tensor ops --
+    # that loop dominated the host cost of this op in profiling).
     lengths = sizes[:, 0]
     component_numel = lengths * inner_numel  # numel of each packed component
     total_len = int(lengths.sum().item())
@@ -99,7 +107,12 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     lengths_dev = lengths.to(padded.device)
     row_offsets_dev = row_offsets.to(padded.device)
 
-    grid = lambda meta: (batch_size,)
+    # ``grid = (batch_size, num_chunks)`` -- one program per (batch, chunk) tile.
+    # ``max_numel`` (largest component's real-element count) sets the chunk count;
+    # ``triton.cdiv`` rounds up so every real element is covered.
+    max_numel = int(lengths.max().item()) * inner_numel
+    num_chunks = triton.cdiv(max_numel, 1024)
+    grid = lambda meta: (batch_size, num_chunks)
     _nested_from_padded_remove_padding_kernel[grid](
         padded,
         values,
@@ -120,11 +133,17 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     # storage offset is the cumulative component numel. ``_nested_view_from_buffer``
     # requires a flat 1D buffer, so view the packed values back to 1D; the
     # component shapes are recovered via ``nested_size``/``nested_strides``.
-    nested_strides = torch.empty_like(sizes)
-    running = torch.ones(batch_size, dtype=torch.int64)
-    for d in range(rank - 1, -1, -1):
-        nested_strides[:, d] = running
-        running = running * sizes[:, d]
+    #
+    # ``nested_strides`` is the same for every component (they share the inner
+    # shape), so build the single inner-stride row once and expand; the storage
+    # offsets are the exclusive prefix sum of component numel.
+    inner_strides = torch.empty(rank, dtype=torch.int64)
+    stride = 1
+    for d in range(rank - 1, 0, -1):
+        inner_strides[d] = stride
+        stride *= inner_dims[d - 1]
+    inner_strides[0] = stride
+    nested_strides = inner_strides.expand(batch_size, rank).contiguous()
 
     storage_offsets = torch.zeros(batch_size, dtype=torch.int64)
     if batch_size > 1:
