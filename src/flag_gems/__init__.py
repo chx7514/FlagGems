@@ -1049,6 +1049,7 @@ _FULL_CONFIG = (
         None,
         (SPARSE_CSR_DISPATCH_KEY,),
     ),
+    ("_nested_from_padded_and_nested_example", _nested_from_padded_and_nested_example),
     ("special_airy_ai", special_airy_ai),
     ("special_airy_ai.out", special_airy_ai_out),
     ("special_bessel_j0", special_bessel_j0),
