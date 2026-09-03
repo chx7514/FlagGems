@@ -137,6 +137,10 @@ _FULL_CONFIG = (
         "_fake_quantize_learnable_per_tensor_affine",
         _fake_quantize_learnable_per_tensor_affine,
     ),
+    (
+        "_fake_quantize_per_tensor_affine_cachemask_tensor_qparams",
+        _fake_quantize_per_tensor_affine_cachemask_tensor_qparams,
+    ),
     ("_flash_attention_backward", flash_attention_backward),
     ("_flash_attention_forward", _flash_attention_forward),
     ("_functional_assert_async.msg", _functional_assert_async),
@@ -1052,10 +1056,6 @@ _FULL_CONFIG = (
         sparse_sampled_addmm_out,
         None,
         (SPARSE_CSR_DISPATCH_KEY,),
-    ),
-    (
-        "_fake_quantize_per_tensor_affine_cachemask_tensor_qparams",
-        _fake_quantize_per_tensor_affine_cachemask_tensor_qparams,
     ),
     ("special_airy_ai", special_airy_ai),
     ("special_airy_ai.out", special_airy_ai_out),
