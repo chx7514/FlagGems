@@ -134,6 +134,10 @@ _FULL_CONFIG = (
     ),
     ("_euclidean_dist", _euclidean_dist),
     (
+        "_fake_quantize_learnable_per_channel_affine",
+        _fake_quantize_learnable_per_channel_affine,
+    ),
+    (
         "_fake_quantize_learnable_per_tensor_affine",
         _fake_quantize_learnable_per_tensor_affine,
     ),
@@ -1052,10 +1056,6 @@ _FULL_CONFIG = (
         sparse_sampled_addmm_out,
         None,
         (SPARSE_CSR_DISPATCH_KEY,),
-    ),
-    (
-        "_fake_quantize_learnable_per_channel_affine",
-        _fake_quantize_learnable_per_channel_affine,
     ),
     ("special_airy_ai", special_airy_ai),
     ("special_airy_ai.out", special_airy_ai_out),
