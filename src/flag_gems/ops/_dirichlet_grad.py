@@ -47,6 +47,87 @@ logger = logging.getLogger(__name__)
 PI = 3.1415926535897932384626433832795028841971
 PSI_10 = 2.25175258906672110764
 
+# Coefficient tables ``c[2][3][3][4]`` for the rational-correction branch of
+# ``_dirichlet_grad_one`` (ported from ATen::native::dirichlet_grad_one).
+# Unrolled as two (3*3*4) flattish arrays and hoisted to module-level
+# ``tl.constexpr`` so the kernel body stays readable; this is equivalent to the
+# inlined assignments and changes neither numerics nor codegen.  (Plain
+# module-level floats are not visible inside ``@triton.jit`` kernels, hence
+# the ``tl.constexpr`` wrapping.)
+C0_000 = tl.constexpr(1.003668233)
+C0_001 = tl.constexpr(-0.01061107488)
+C0_002 = tl.constexpr(-0.0657888334)
+C0_003 = tl.constexpr(0.01201642863)
+C0_010 = tl.constexpr(0.6336835991)
+C0_011 = tl.constexpr(-0.3557432599)
+C0_012 = tl.constexpr(0.05486251648)
+C0_013 = tl.constexpr(-0.001465281033)
+C0_020 = tl.constexpr(-0.03276231906)
+C0_021 = tl.constexpr(0.004474107445)
+C0_022 = tl.constexpr(0.002429354597)
+C0_023 = tl.constexpr(-0.0001557569013)
+C0_100 = tl.constexpr(0.221950385)
+C0_101 = tl.constexpr(-0.3187676331)
+C0_102 = tl.constexpr(0.01799915743)
+C0_103 = tl.constexpr(0.01074823814)
+C0_110 = tl.constexpr(-0.2951249643)
+C0_111 = tl.constexpr(0.06219954479)
+C0_112 = tl.constexpr(0.01535556598)
+C0_113 = tl.constexpr(0.001550077057)
+C0_120 = tl.constexpr(0.02155310298)
+C0_121 = tl.constexpr(0.004170831599)
+C0_122 = tl.constexpr(0.001292462449)
+C0_123 = tl.constexpr(6.976601077e-05)
+C0_200 = tl.constexpr(-0.05980841433)
+C0_201 = tl.constexpr(0.008441916499)
+C0_202 = tl.constexpr(0.01085618172)
+C0_203 = tl.constexpr(0.002319392565)
+C0_210 = tl.constexpr(0.02911413504)
+C0_211 = tl.constexpr(0.01400243777)
+C0_212 = tl.constexpr(-0.002721828457)
+C0_213 = tl.constexpr(0.000751041181)
+C0_220 = tl.constexpr(0.005900514878)
+C0_221 = tl.constexpr(-0.001936558688)
+C0_222 = tl.constexpr(-9.495446725e-06)
+C0_223 = tl.constexpr(5.385558597e-05)
+
+C1_000 = tl.constexpr(1.0)
+C1_001 = tl.constexpr(-0.02924021934)
+C1_002 = tl.constexpr(-0.04438342661)
+C1_003 = tl.constexpr(0.007285809825)
+C1_010 = tl.constexpr(0.6357567472)
+C1_011 = tl.constexpr(-0.3473456711)
+C1_012 = tl.constexpr(0.05454656494)
+C1_013 = tl.constexpr(-0.002407477521)
+C1_020 = tl.constexpr(-0.03301322327)
+C1_021 = tl.constexpr(0.004845219414)
+C1_022 = tl.constexpr(0.00231480583)
+C1_023 = tl.constexpr(-0.0002307248149)
+C1_100 = tl.constexpr(0.5925320577)
+C1_101 = tl.constexpr(-0.1757678135)
+C1_102 = tl.constexpr(0.01505928619)
+C1_103 = tl.constexpr(0.000564515273)
+C1_110 = tl.constexpr(0.1014815858)
+C1_111 = tl.constexpr(-0.06589186703)
+C1_112 = tl.constexpr(0.01272886114)
+C1_113 = tl.constexpr(-0.0007316646956)
+C1_120 = tl.constexpr(-0.007258081865)
+C1_121 = tl.constexpr(0.001096195486)
+C1_122 = tl.constexpr(0.0003934994223)
+C1_123 = tl.constexpr(-4.12701925e-05)
+C1_200 = tl.constexpr(0.06469649321)
+C1_201 = tl.constexpr(-0.0236701437)
+C1_202 = tl.constexpr(0.002902096474)
+C1_203 = tl.constexpr(-5.896963079e-05)
+C1_210 = tl.constexpr(0.001925008108)
+C1_211 = tl.constexpr(-0.002869809258)
+C1_212 = tl.constexpr(0.0008000589141)
+C1_213 = tl.constexpr(-6.063713228e-05)
+C1_220 = tl.constexpr(-0.0003477407336)
+C1_221 = tl.constexpr(6.95975487e-05)
+C1_222 = tl.constexpr(1.097287507e-05)
+C1_223 = tl.constexpr(-1.650969693e-06)
+
 
 @triton.jit
 def _div_rn(a, b):
@@ -255,80 +336,6 @@ def _dirichlet_grad_one(x, alpha, total):
     u = tl_extra_shim.log(x)
     a = tl_extra_shim.log(alpha) - u
     b = tl_extra_shim.log(total) - a
-    # Coefficient tables c[2][3][3][4].  Unrolled as two (3*3*4) flattish arrays.
-    c0_000 = 1.003668233
-    c0_001 = -0.01061107488
-    c0_002 = -0.0657888334
-    c0_003 = 0.01201642863
-    c0_010 = 0.6336835991
-    c0_011 = -0.3557432599
-    c0_012 = 0.05486251648
-    c0_013 = -0.001465281033
-    c0_020 = -0.03276231906
-    c0_021 = 0.004474107445
-    c0_022 = 0.002429354597
-    c0_023 = -0.0001557569013
-    c0_100 = 0.221950385
-    c0_101 = -0.3187676331
-    c0_102 = 0.01799915743
-    c0_103 = 0.01074823814
-    c0_110 = -0.2951249643
-    c0_111 = 0.06219954479
-    c0_112 = 0.01535556598
-    c0_113 = 0.001550077057
-    c0_120 = 0.02155310298
-    c0_121 = 0.004170831599
-    c0_122 = 0.001292462449
-    c0_123 = 6.976601077e-05
-    c0_200 = -0.05980841433
-    c0_201 = 0.008441916499
-    c0_202 = 0.01085618172
-    c0_203 = 0.002319392565
-    c0_210 = 0.02911413504
-    c0_211 = 0.01400243777
-    c0_212 = -0.002721828457
-    c0_213 = 0.000751041181
-    c0_220 = 0.005900514878
-    c0_221 = -0.001936558688
-    c0_222 = -9.495446725e-06
-    c0_223 = 5.385558597e-05
-
-    c1_000 = 1.0
-    c1_001 = -0.02924021934
-    c1_002 = -0.04438342661
-    c1_003 = 0.007285809825
-    c1_010 = 0.6357567472
-    c1_011 = -0.3473456711
-    c1_012 = 0.05454656494
-    c1_013 = -0.002407477521
-    c1_020 = -0.03301322327
-    c1_021 = 0.004845219414
-    c1_022 = 0.00231480583
-    c1_023 = -0.0002307248149
-    c1_100 = 0.5925320577
-    c1_101 = -0.1757678135
-    c1_102 = 0.01505928619
-    c1_103 = 0.000564515273
-    c1_110 = 0.1014815858
-    c1_111 = -0.06589186703
-    c1_112 = 0.01272886114
-    c1_113 = -0.0007316646956
-    c1_120 = -0.007258081865
-    c1_121 = 0.001096195486
-    c1_122 = 0.0003934994223
-    c1_123 = -4.12701925e-05
-    c1_200 = 0.06469649321
-    c1_201 = -0.0236701437
-    c1_202 = 0.002902096474
-    c1_203 = -5.896963079e-05
-    c1_210 = 0.001925008108
-    c1_211 = -0.002869809258
-    c1_212 = 0.0008000589141
-    c1_213 = -6.063713228e-05
-    c1_220 = -0.0003477407336
-    c1_221 = 6.95975487e-05
-    c1_222 = 1.097287507e-05
-    c1_223 = -1.650969693e-06
 
     pow_u0 = 1.0
     pow_u1 = u
@@ -344,40 +351,40 @@ def _dirichlet_grad_one(x, alpha, total):
     # loop variables, which Triton does not support.
 
     ua = pow_u0 * pow_a0
-    p = p + ua * (c0_000 + b * (c0_001 + b * (c0_002 + b * c0_003)))
-    q = q + ua * (c1_000 + b * (c1_001 + b * (c1_002 + b * c1_003)))
+    p = p + ua * (C0_000 + b * (C0_001 + b * (C0_002 + b * C0_003)))
+    q = q + ua * (C1_000 + b * (C1_001 + b * (C1_002 + b * C1_003)))
 
     ua = pow_u0 * pow_a1
-    p = p + ua * (c0_010 + b * (c0_011 + b * (c0_012 + b * c0_013)))
-    q = q + ua * (c1_010 + b * (c1_011 + b * (c1_012 + b * c1_013)))
+    p = p + ua * (C0_010 + b * (C0_011 + b * (C0_012 + b * C0_013)))
+    q = q + ua * (C1_010 + b * (C1_011 + b * (C1_012 + b * C1_013)))
 
     ua = pow_u0 * pow_a2
-    p = p + ua * (c0_020 + b * (c0_021 + b * (c0_022 + b * c0_023)))
-    q = q + ua * (c1_020 + b * (c1_021 + b * (c1_022 + b * c1_023)))
+    p = p + ua * (C0_020 + b * (C0_021 + b * (C0_022 + b * C0_023)))
+    q = q + ua * (C1_020 + b * (C1_021 + b * (C1_022 + b * C1_023)))
 
     ua = pow_u1 * pow_a0
-    p = p + ua * (c0_100 + b * (c0_101 + b * (c0_102 + b * c0_103)))
-    q = q + ua * (c1_100 + b * (c1_101 + b * (c1_102 + b * c1_103)))
+    p = p + ua * (C0_100 + b * (C0_101 + b * (C0_102 + b * C0_103)))
+    q = q + ua * (C1_100 + b * (C1_101 + b * (C1_102 + b * C1_103)))
 
     ua = pow_u1 * pow_a1
-    p = p + ua * (c0_110 + b * (c0_111 + b * (c0_112 + b * c0_113)))
-    q = q + ua * (c1_110 + b * (c1_111 + b * (c1_112 + b * c1_113)))
+    p = p + ua * (C0_110 + b * (C0_111 + b * (C0_112 + b * C0_113)))
+    q = q + ua * (C1_110 + b * (C1_111 + b * (C1_112 + b * C1_113)))
 
     ua = pow_u1 * pow_a2
-    p = p + ua * (c0_120 + b * (c0_121 + b * (c0_122 + b * c0_123)))
-    q = q + ua * (c1_120 + b * (c1_121 + b * (c1_122 + b * c1_123)))
+    p = p + ua * (C0_120 + b * (C0_121 + b * (C0_122 + b * C0_123)))
+    q = q + ua * (C1_120 + b * (C1_121 + b * (C1_122 + b * C1_123)))
 
     ua = pow_u2 * pow_a0
-    p = p + ua * (c0_200 + b * (c0_201 + b * (c0_202 + b * c0_203)))
-    q = q + ua * (c1_200 + b * (c1_201 + b * (c1_202 + b * c1_203)))
+    p = p + ua * (C0_200 + b * (C0_201 + b * (C0_202 + b * C0_203)))
+    q = q + ua * (C1_200 + b * (C1_201 + b * (C1_202 + b * C1_203)))
 
     ua = pow_u2 * pow_a1
-    p = p + ua * (c0_210 + b * (c0_211 + b * (c0_212 + b * c0_213)))
-    q = q + ua * (c1_210 + b * (c1_211 + b * (c1_212 + b * c1_213)))
+    p = p + ua * (C0_210 + b * (C0_211 + b * (C0_212 + b * C0_213)))
+    q = q + ua * (C1_210 + b * (C1_211 + b * (C1_212 + b * C1_213)))
 
     ua = pow_u2 * pow_a2
-    p = p + ua * (c0_220 + b * (c0_221 + b * (c0_222 + b * c0_223)))
-    q = q + ua * (c1_220 + b * (c1_221 + b * (c1_222 + b * c1_223)))
+    p = p + ua * (C0_220 + b * (C0_221 + b * (C0_222 + b * C0_223)))
+    q = q + ua * (C1_220 + b * (C1_221 + b * (C1_222 + b * C1_223)))
 
     approx = _div_rn(x * (_digamma_one(total) - _digamma_one(alpha)), beta)
     res_rational = _div_rn(p, q) * approx
