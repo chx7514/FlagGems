@@ -21,18 +21,9 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, tl_extra_shim
 
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def _round_half_to_even(x):
-    """Round to nearest with ties to even (banker's rounding). x must be fp32."""
-    r = tl.floor(x)
-    d = x - r  # fractional part
-    is_odd = tl.abs(r - 2.0 * tl.floor(r / 2.0)) > 0.5
-    return tl.where((d > 0.5) | ((tl.abs(d - 0.5) < 1e-10) & is_odd), r + 1.0, r)
 
 
 @libentry()
@@ -58,7 +49,9 @@ def _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_kernel(
     enabled = tl.load(fake_quant_enabled_ptr) != 0
 
     x = tl.load(x_ptr + offsets, mask=load_mask, other=0.0).to(tl.float32)
-    q = _round_half_to_even(x / scale + zero_point)
+    # nearbyint rounds half to even under the default rounding mode, matching
+    # the aten reference; same helper the other fake-quant kernels use.
+    q = tl_extra_shim.nearbyint(x / scale + zero_point)
     in_range = (q >= QUANT_MIN) & (q <= QUANT_MAX)
     q_clamped = tl.minimum(tl.maximum(q, QUANT_MIN), QUANT_MAX)
     quantized = scale * (q_clamped - zero_point)
