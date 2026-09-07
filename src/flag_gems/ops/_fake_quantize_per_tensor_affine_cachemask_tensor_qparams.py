@@ -16,10 +16,12 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import pointwise_dynamic
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
@@ -33,44 +35,71 @@ def _round_half_to_even(x):
     return tl.where((d > 0.5) | ((tl.abs(d - 0.5) < 1e-10) & is_odd), r + 1.0, r)
 
 
-@pointwise_dynamic(
-    is_tensor=[True, False, False, False, False, False],
-    num_outputs=2,
-    promotion_methods=[
-        (0, "DEFAULT"),
-        (0, "ALWAYS_BOOL"),
-    ],
-)
-@triton.jit
+@libentry()
+@triton.jit(do_not_specialize=["n_elements"])
 def _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_kernel(
-    x,
-    scale,
-    zero_point,
-    fake_quant_enabled,
-    quant_min,
-    quant_max,
+    x_ptr,
+    scale_ptr,
+    zero_point_ptr,
+    fake_quant_enabled_ptr,
+    out_ptr,
+    mask_ptr,
+    n_elements,
+    QUANT_MIN: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    # Compute in fp32 for numerical stability across fp16/bf16 inputs.
-    x_fp32 = x.to(tl.float32)
-    q = _round_half_to_even(x_fp32 / scale + zero_point)
-    in_range = (q >= quant_min) & (q <= quant_max)
-    q_clamped = tl.minimum(tl.maximum(q, quant_min), quant_max)
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    load_mask = offsets < n_elements
+
+    # Scalar qparams stay on device: one load per program, then cache hits.
+    scale = tl.load(scale_ptr).to(tl.float32)
+    zero_point = tl.load(zero_point_ptr).to(tl.float32)
+    enabled = tl.load(fake_quant_enabled_ptr) != 0
+
+    x = tl.load(x_ptr + offsets, mask=load_mask, other=0.0).to(tl.float32)
+    q = _round_half_to_even(x / scale + zero_point)
+    in_range = (q >= QUANT_MIN) & (q <= QUANT_MAX)
+    q_clamped = tl.minimum(tl.maximum(q, QUANT_MIN), QUANT_MAX)
     quantized = scale * (q_clamped - zero_point)
     # When fake quantization is disabled, pass through the input and report
     # the whole tensor as in-range (mask all True).
-    output = tl.where(fake_quant_enabled, quantized.to(x.dtype), x)
-    mask = tl.where(fake_quant_enabled, in_range, True)
-    return output, mask
+    output = tl.where(enabled, quantized.to(out_ptr.dtype.element_ty), x)
+    mask = tl.where(enabled, in_range, True)
+
+    tl.store(out_ptr + offsets, output, mask=load_mask)
+    tl.store(mask_ptr + offsets, mask, mask=load_mask)
 
 
 def _fake_quantize_per_tensor_affine_cachemask_tensor_qparams(
     self, scale, zero_point, fake_quant_enabled, quant_min, quant_max
 ):
     logger.debug("GEMS FAKE_QUANTIZE_PER_TENSOR_AFFINE_CACHEMASK_TENSOR_QPARAMS")
-    scale_val = scale.item()
-    zero_point_val = zero_point.item()
-    fake_quant_enabled_val = bool(fake_quant_enabled.item())
-    out, mask = _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_kernel(
-        self, scale_val, zero_point_val, fake_quant_enabled_val, quant_min, quant_max
-    )
+    self = self.contiguous()
+    out = torch.empty_like(self)
+    mask = torch.empty_like(self, dtype=torch.bool)
+
+    n_elements = self.numel()
+    if n_elements == 0:
+        return out, mask
+
+    block_size = 512
+    # fp32 moves 12 bytes/element (4 in, 4 out, 4 mask) and benefits from more
+    # CTAs to saturate bandwidth; fp16/bf16 prefer deeper per-CTA parallelism.
+    num_warps = 4 if self.dtype == torch.float32 else 8
+    grid = (triton.cdiv(n_elements, block_size),)
+    with torch_device_fn.device(self.device):
+        _fake_quantize_per_tensor_affine_cachemask_tensor_qparams_kernel[grid](
+            self,
+            scale,
+            zero_point,
+            fake_quant_enabled,
+            out,
+            mask,
+            n_elements,
+            QUANT_MIN=quant_min,
+            QUANT_MAX=quant_max,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
     return out, mask
