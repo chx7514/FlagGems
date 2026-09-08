@@ -98,3 +98,15 @@ def test_split_with_sizes_edge_cases(shape, dtype):
     assert len(res_out) == len(ref_out), "Number of splits mismatch"
     for i, (res, ref) in enumerate(zip(res_out, ref_out)):
         utils.gems_assert_equal(res, ref)
+
+
+@pytest.mark.split_with_sizes
+@pytest.mark.parametrize("shape", [(10, 4, 8)])
+@pytest.mark.parametrize("dim", [3, -4])
+def test_split_with_sizes_dim_out_of_range(shape, dim):
+    # Regression: out-of-range dims must raise IndexError like PyTorch,
+    # not silently wrap around (e.g. dim=3 on a 3-D tensor used to wrap to 0).
+    inp = torch.randn(shape, device=flag_gems.device)
+
+    with pytest.raises(IndexError):
+        flag_gems.split_with_sizes(inp, [4, 4, 2], dim=dim)

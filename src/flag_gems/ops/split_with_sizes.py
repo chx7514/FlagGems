@@ -31,6 +31,20 @@ def _normalize_split_sizes(split_sizes):
     return [int(size) for size in split_sizes]
 
 
+def _normalize_dim(inp, dim):
+    ndim = inp.ndim
+    # Normalize negative dims using the same convention as aten.
+    if dim < 0:
+        dim += ndim
+    # Match aten's IndexError message for out-of-range dimensions.
+    if not (0 <= dim < ndim):
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of "
+            f"[-{ndim}, {ndim - 1}], but got {dim - ndim if dim < 0 else dim})"
+        )
+    return dim
+
+
 def split_with_sizes(
     inp: torch.Tensor,
     split_sizes: Union[List[int], torch.Tensor],
@@ -44,7 +58,7 @@ def split_with_sizes(
     """
     logger.debug("GEMS SPLIT_WITH_SIZES")
 
-    dim = dim % inp.ndim
+    dim = _normalize_dim(inp, dim)
     split_sizes = _normalize_split_sizes(split_sizes)
 
     split_sum = sum(split_sizes)
