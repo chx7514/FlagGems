@@ -29,10 +29,9 @@ def _cummax_helper(input, values, indices, dim):
     ``indices`` tensors along the given ``dim``.
 
     This is the out-of-place kernel used by ``aten::cummax`` /
-    ``aten::cummax.out``.  The Triton scan kernels reused from
-    ``flag_gems.ops.cummax`` operate on contiguous tensors, so we run the
-    scan on a contiguous staging buffer and copy the results back into the
-    caller-provided tensors (which may be non-contiguous).
+    ``aten::cummax.out``.  When the caller-provided ``values`` / ``indices``
+    buffers are contiguous (the common case), the scan kernels write directly
+    into them; otherwise a contiguous staging buffer is used and copied back.
     """
     logger.debug("GEMS CUMMAX_HELPER")
     assert dim >= -input.ndim and dim < input.ndim, "Invalid dim"
@@ -44,31 +43,50 @@ def _cummax_helper(input, values, indices, dim):
         M *= shape[i]
     # bool inputs are promoted to int64 (consistent with aten::cummax and to
     # avoid the shared scan kernels, which do not support int1 directly).
-    if input.dtype is torch.bool:
+    is_bool = input.dtype is torch.bool
+    if is_bool:
         input = input.to(torch.int64)
     input = input.contiguous()
     K = input.numel() // M // N
 
-    # The scan kernels work on the (possibly promoted) value dtype.
-    values_dtype = input.dtype
-
-    # Stage the scan results in contiguous buffers matching the
-    # contiguous layout of `input`.
-    staged_values = torch.empty_like(input, dtype=values_dtype)
-    staged_indices = torch.empty_like(input, dtype=torch.int64)
-
-    compute_dtype = staged_values.dtype
+    compute_dtype = input.dtype
     if input.dtype == torch.float16 or input.dtype == torch.bfloat16:
         compute_dtype = torch.float32
 
-    if M == 1 and K == 1:
-        scan_then_fan_col(input, staged_values, staged_indices, N, compute_dtype)
-    elif M * K <= 16:
-        scan_then_fan(input, staged_values, staged_indices, M, N, K, compute_dtype)
-    else:
-        scan_then_fan_loop(input, staged_values, staged_indices, M, N, K, compute_dtype)
+    # Fast path: write the scan result directly into the caller-provided
+    # contiguous buffers to avoid an extra allocation + copy. bool inputs
+    # take the general path because their values are computed in the
+    # promoted int64 dtype.
+    if (
+        not is_bool
+        and values.is_contiguous()
+        and indices.is_contiguous()
+        and values.dtype == input.dtype
+    ):
+        out = values
+        out_indices = indices
+        if M == 1 and K == 1:
+            scan_then_fan_col(input, out, out_indices, N, compute_dtype)
+        elif M * K <= 16:
+            scan_then_fan(input, out, out_indices, M, N, K, compute_dtype)
+        else:
+            scan_then_fan_loop(input, out, out_indices, M, N, K, compute_dtype)
+        return None
 
-    # Copy the staged results into the caller-provided tensors, which may
-    # be non-contiguous or use the original (un-promoted) value dtype.
-    values.copy_(staged_values)
-    indices.copy_(staged_indices)
+    # General path: compute into freshly allocated contiguous tensors (so the
+    # scan kernels, which assume contiguous storage, work for any caller-provided
+    # out layout/dtype), then copy the results back into the caller-provided
+    # tensors, which may be non-contiguous or use the original (un-promoted)
+    # value dtype.
+    out = torch.empty_like(input)
+    out_indices = torch.empty_like(input, dtype=torch.int64)
+
+    if M == 1 and K == 1:
+        scan_then_fan_col(input, out, out_indices, N, compute_dtype)
+    elif M * K <= 16:
+        scan_then_fan(input, out, out_indices, M, N, K, compute_dtype)
+    else:
+        scan_then_fan_loop(input, out, out_indices, M, N, K, compute_dtype)
+
+    values.copy_(out)
+    indices.copy_(out_indices)
