@@ -59,12 +59,16 @@ from flag_gems.ops._embedding_bag_per_sample_weights_backward import (
     _embedding_bag_per_sample_weights_backward,
 )
 from flag_gems.ops._euclidean_dist import _euclidean_dist
+from flag_gems.ops._fake_quantize_learnable_per_channel_affine_backward import (
+    _fake_quantize_learnable_per_channel_affine_backward,
+)
 from flag_gems.ops._fake_quantize_learnable_per_tensor_affine import (
     _fake_quantize_learnable_per_tensor_affine,
 )
 from flag_gems.ops._fake_quantize_learnable_per_tensor_affine_backward import (
     _fake_quantize_learnable_per_tensor_affine_backward,
 )
+from flag_gems.ops._fill_mem_eff_dropout_mask_ import _fill_mem_eff_dropout_mask_
 from flag_gems.ops._flash_attention_forward import _flash_attention_forward
 from flag_gems.ops._functional_sym_constrain_range import (
     _functional_sym_constrain_range,
@@ -521,6 +525,7 @@ from flag_gems.ops.lift_fresh_copy import lift_fresh_copy, lift_fresh_copy_out
 from flag_gems.ops.linalg_cholesky import linalg_cholesky
 from flag_gems.ops.linalg_cross import linalg_cross, linalg_cross_out
 from flag_gems.ops.linalg_det import linalg_det, linalg_det_out
+from flag_gems.ops.linalg_eig import linalg_eig
 from flag_gems.ops.linalg_householder_product import linalg_householder_product
 from flag_gems.ops.linalg_ldl_factor import ldl_factor
 from flag_gems.ops.linalg_ldl_solve import linalg_ldl_solve
@@ -875,6 +880,7 @@ from flag_gems.ops.special_shifted_chebyshev_polynomial_w import (
     special_shifted_chebyshev_polynomial_w,
 )
 from flag_gems.ops.special_sinc import special_sinc
+from flag_gems.ops.special_softmax import special_softmax
 from flag_gems.ops.special_xlog1py import special_xlog1py
 from flag_gems.ops.split_with_sizes_copy import split_with_sizes_copy
 from flag_gems.ops.sqrt import sqrt, sqrt_
@@ -1006,8 +1012,10 @@ __all__ = [
     "_embedding_bag_dense_backward",
     "_embedding_bag_per_sample_weights_backward",
     "_euclidean_dist",
+    "_fake_quantize_learnable_per_channel_affine_backward",
     "_fake_quantize_learnable_per_tensor_affine",
     "_fake_quantize_learnable_per_tensor_affine_backward",
+    "_fill_mem_eff_dropout_mask_",
     "_flash_attention_forward",
     "_functional_assert_async",
     "_functional_sym_constrain_range",
@@ -1517,6 +1525,7 @@ __all__ = [
     "linalg_cross_out",
     "linalg_det",
     "linalg_det_out",
+    "linalg_eig",
     "linalg_householder_product",
     "linalg_ldl_solve",
     "linalg_lstsq",
@@ -1900,6 +1909,7 @@ __all__ = [
     "special_shifted_chebyshev_polynomial_v",
     "special_shifted_chebyshev_polynomial_w",
     "special_sinc",
+    "special_softmax",
     "special_xlog1py",
     "split_with_sizes_copy",
     "sqrt",
