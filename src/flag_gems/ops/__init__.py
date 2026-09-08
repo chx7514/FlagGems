@@ -536,7 +536,12 @@ from flag_gems.ops.linalg_lu_factor_ex import (
     linalg_lu_factor_ex,
     linalg_lu_factor_ex_out,
 )
+from flag_gems.ops.linalg_matrix_exp import linalg_matrix_exp, linalg_matrix_exp_out
 from flag_gems.ops.linalg_matrix_norm import linalg_matrix_norm
+from flag_gems.ops.linalg_matrix_power import (
+    linalg_matrix_power,
+    linalg_matrix_power_out,
+)
 from flag_gems.ops.linalg_matrix_rank import (
     linalg_matrix_rank,
     linalg_matrix_rank_out,
@@ -912,6 +917,7 @@ from flag_gems.ops.threshold_ import threshold_
 from flag_gems.ops.tile import tile
 from flag_gems.ops.to import to_copy
 from flag_gems.ops.topk import topk
+from flag_gems.ops.topk_w8a16_fp8 import topk_w8a16_fp8
 from flag_gems.ops.trace import trace
 from flag_gems.ops.transpose import transpose
 from flag_gems.ops.tril import tril, tril_, tril_out
@@ -1543,7 +1549,11 @@ __all__ = [
     "linalg_lu_factor_ex_out",
     "linalg_lu_factor_out",
     "linalg_lu_out",
+    "linalg_matrix_exp",
+    "linalg_matrix_exp_out",
     "linalg_matrix_norm",
+    "linalg_matrix_power",
+    "linalg_matrix_power_out",
     "linalg_matrix_rank",
     "linalg_matrix_rank_out",
     "linalg_matrix_rank_tol",
@@ -1964,6 +1974,7 @@ __all__ = [
     "tile",
     "to_copy",
     "topk",
+    "topk_w8a16_fp8",
     "trace",
     "transpose",
     "tril",
