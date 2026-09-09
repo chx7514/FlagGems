@@ -30,32 +30,33 @@ logger = logging.getLogger(__name__)
 def _nested_from_padded_remove_padding_kernel(
     padded,
     values,
-    lengths,
-    row_offsets,
-    INNER_NUMEL: tl.constexpr,
-    L: tl.constexpr,
+    offsets,
+    PAD_BATCH_STRIDE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Compacts a padded dense tensor into a flat buffer by removing the padding.
 
-    The grid is ``(batch_size, num_chunks)``: program ``pid`` along axis 0 owns
-    batch element ``pid``, and the axis-1 programs tile its contiguous
-    ``length * INNER_NUMEL`` real elements in ``BLOCK_SIZE``-sized chunks. Tiling
-    the copy along the chunk axis (instead of a single program looping over the
-    whole component) keeps the memory-bound un-pad copy parallel across chunks,
-    which is essential when a component is large -- a single program per batch
-    serializes the copy and underutilizes the device.
+    ``offsets`` is the (B+1)-element exclusive prefix sum of per-component numel
+    in element units, so component ``b`` spans ``[offsets[b], offsets[b+1])``. The
+    grid is ``(batch_size, num_chunks)``: program ``b`` along axis 0 owns batch
+    element ``b``, and the axis-1 programs tile its contiguous real elements in
+    ``BLOCK_SIZE``-sized chunks. The chunk count is bounded by
+    ``PAD_BATCH_STRIDE`` (the padded row length) rather than ``max(lengths)``,
+    so no host-side reduction is needed to size the grid; the extra blocks on
+    short components are fully masked and stay at the kernel-launch floor.
     """
     b = tle.program_id(axis=0)
     chunk = tle.program_id(axis=1)
-    length = tl.load(lengths + b)
-    numel = length * INNER_NUMEL
+
+    start = tl.load(offsets + b)
+    end = tl.load(offsets + b + 1)
+    length = end - start
 
     idx = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = idx < numel
+    mask = idx < length
 
-    dst = tl.load(row_offsets + b) * INNER_NUMEL + idx
-    src = b * L * INNER_NUMEL + idx
+    dst = start + idx
+    src = b * PAD_BATCH_STRIDE + idx
 
     v = tl.load(padded + src, mask=mask)
     tl.store(values + dst, v, mask=mask)
@@ -81,7 +82,6 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     padded = padded.contiguous()
     sizes = cpu_nested_shape_example.to(torch.int64)
     batch_size = padded.size(0)
-    L = padded.size(1)
     inner_dims = list(padded.shape[2:])
     rank = 1 + len(inner_dims)
 
@@ -89,65 +89,50 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     for d in inner_dims:
         inner_numel *= d
 
-    # All components share the same inner shape, so their ``nested_strides`` row
-    # is identical across the batch; only ``lengths`` differ. Compute the host
-    # metadata vectorized (no per-dim Python loop over per-element tensor ops --
-    # that loop dominated the host cost of this op in profiling).
-    lengths = sizes[:, 0]
-    component_numel = lengths * inner_numel  # numel of each packed component
-    total_len = int(lengths.sum().item())
-    total = total_len * inner_numel
-    # Row offsets (jagged) with a leading zero.
-    row_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.int64), torch.cumsum(lengths, dim=0)]
+    # One C++ call replaces the previous hand-rolled per-dim stride loop and two
+    # cumsum calls: it returns the contiguous strides and the exclusive prefix
+    # sum of per-component numel (element units) used as storage offsets.
+    nested_strides, storage_offsets = (
+        torch.ops.aten._nested_compute_contiguous_strides_offsets.default(sizes)
     )
 
+    lengths = sizes[:, 0]
+    total_len = int(lengths.sum().item())
+    total = total_len * inner_numel
     values = torch.empty(total, dtype=padded.dtype, device=padded.device)
 
-    lengths_dev = lengths.to(padded.device)
-    row_offsets_dev = row_offsets.to(padded.device)
+    # Build the (B+1)-element offset fence the kernel indexes as
+    # ``[offsets[b], offsets[b+1])``. ``storage_offsets`` is length B (the
+    # exclusive prefix sum); append the total as the closing fence so the kernel
+    # can recover each component's length with one subtraction instead of a
+    # separate ``lengths`` tensor. This replaces two tiny H2D copies (lengths +
+    # row_offsets) with a single transfer.
+    offset_fence = torch.cat(
+        [storage_offsets, torch.tensor([total], dtype=torch.int64)]
+    )
+    offsets_dev = offset_fence.to(padded.device, non_blocking=True)
 
-    # ``grid = (batch_size, num_chunks)`` -- one program per (batch, chunk) tile.
-    # ``max_numel`` (largest component's real-element count) sets the chunk count;
-    # ``triton.cdiv`` rounds up so every real element is covered.
-    max_numel = int(lengths.max().item()) * inner_numel
-    num_chunks = triton.cdiv(max_numel, 1024)
+    # Size the chunk axis by ``padded.stride(0)`` (the padded row length in
+    # elements) instead of ``lengths.max()``. This is a free upper bound on any
+    # component's real-element count and avoids a host reduction; the extra
+    # fully-masked blocks on shorter components stay at the kernel-launch floor.
+    pad_batch_stride = padded.stride(0) // inner_numel * inner_numel
+    num_chunks = triton.cdiv(pad_batch_stride, 1024)
     grid = lambda meta: (batch_size, num_chunks)
     _nested_from_padded_remove_padding_kernel[grid](
         padded,
         values,
-        lengths_dev,
-        row_offsets_dev,
-        INNER_NUMEL=inner_numel,
-        L=L,
-        # 1024 threads = 32 full warps; saturates memory bandwidth for this
-        # elementwise un-padding copy, so a fixed block beats autotune overhead.
+        offsets_dev,
+        PAD_BATCH_STRIDE=pad_batch_stride,
+        # A fixed tile size avoids autotuning overhead for this simple
+        # memory-bound un-pad copy. BLOCK_SIZE=1024 performed best among the
+        # tested configurations on H20; the kernel is not the bottleneck of
+        # this op (see profiling in the PR description), so autotune cost would
+        # only add host overhead.
         BLOCK_SIZE=1024,
     )
 
     values = values.view(total_len, *inner_dims)
-
-    # Reconstruct a legacy (``torch.strided`` layout) NestedTensor directly from
-    # the packed values, matching the reference aten implementation. Component
-    # ``b`` is the contiguous ``[len_i, *inner_dims]`` slice of ``values`` whose
-    # storage offset is the cumulative component numel. ``_nested_view_from_buffer``
-    # requires a flat 1D buffer, so view the packed values back to 1D; the
-    # component shapes are recovered via ``nested_size``/``nested_strides``.
-    #
-    # ``nested_strides`` is the same for every component (they share the inner
-    # shape), so build the single inner-stride row once and expand; the storage
-    # offsets are the exclusive prefix sum of component numel.
-    inner_strides = torch.empty(rank, dtype=torch.int64)
-    stride = 1
-    for d in range(rank - 1, 0, -1):
-        inner_strides[d] = stride
-        stride *= inner_dims[d - 1]
-    inner_strides[0] = stride
-    nested_strides = inner_strides.expand(batch_size, rank).contiguous()
-
-    storage_offsets = torch.zeros(batch_size, dtype=torch.int64)
-    if batch_size > 1:
-        storage_offsets[1:] = torch.cumsum(component_numel[:-1], dim=0)
 
     return torch.ops.aten._nested_view_from_buffer.default(
         values.view(-1), sizes, nested_strides, storage_offsets
