@@ -19,9 +19,15 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops._nested_view_from_jagged import _nested_view_from_jagged
+from flag_gems.utils import libentry
+
 logger = logging.getLogger(__name__)
 
+_BLOCK_SIZE = 1024
 
+
+@libentry()
 @triton.jit
 def _nested_view_from_jagged_copy_kernel(
     src_ptr,
@@ -35,22 +41,6 @@ def _nested_view_from_jagged_copy_kernel(
     mask = offsets < n_elements
     vals = tl.load(src_ptr + offsets, mask=mask)
     tl.store(dst_ptr + offsets, vals, mask=mask)
-
-
-def _maybe_int(val):
-    """Convert the `Tensor? min_seqlen` / `max_seqlen` arguments to an int.
-
-    Torch encodes these cached metadata values as a `torch.zeros(val, 0)`
-    shaped tensor (see `torch.nested._internal.nested_tensor._store_val_in_tensor`),
-    so the actual value is the size of the leading dimension.
-    """
-    if val is None:
-        return None
-    if isinstance(val, torch.Tensor):
-        if val.numel() == 1:
-            return int(val.item())
-        return int(val.shape[0])
-    return int(val)
 
 
 def _nested_view_from_jagged_copy(
@@ -73,16 +63,20 @@ def _nested_view_from_jagged_copy(
     n_elements = values_copy.numel()
 
     if n_elements > 0:
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        grid = (triton.cdiv(n_elements, _BLOCK_SIZE),)
         _nested_view_from_jagged_copy_kernel[grid](
-            src, values_copy, n_elements, BLOCK_SIZE=1024
+            src,
+            values_copy,
+            n_elements,
+            BLOCK_SIZE=_BLOCK_SIZE,
         )
 
-    return torch.nested.nested_tensor_from_jagged(
+    return _nested_view_from_jagged(
         values_copy,
-        offsets=offsets,
-        lengths=lengths,
-        jagged_dim=ragged_idx,
-        min_seqlen=_maybe_int(min_seqlen),
-        max_seqlen=_maybe_int(max_seqlen),
+        offsets,
+        dummy,
+        lengths,
+        ragged_idx,
+        min_seqlen,
+        max_seqlen,
     )
