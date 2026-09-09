@@ -83,7 +83,6 @@ def _nested_from_padded(padded, cpu_nested_shape_example, fuse_transform_0213=Fa
     sizes = cpu_nested_shape_example.to(torch.int64)
     batch_size = padded.size(0)
     inner_dims = list(padded.shape[2:])
-    rank = 1 + len(inner_dims)
 
     inner_numel = 1
     for d in inner_dims:
