@@ -33,30 +33,31 @@ def _embedding_bag_sparse_backward_kernel(
     bag_size_ptr,
     per_sample_weights_ptr,
     values_ptr,
-    num_weights,
-    padding_idx,
-    mode,
-    has_per_sample_weights,
+    num_valid_samples,
+    EMBED_DIM,
+    MODE: tl.constexpr,
+    HAS_PSW: tl.constexpr,
+    SAMPLES_PER_PROG: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    EMBED_DIM: tl.constexpr,
 ):
     """Kernel for _embedding_bag_sparse_backward.
 
-    Computes the per-sample gradient values of the sparse (COO) output.
+    Each program handles SAMPLES_PER_PROG consecutive valid samples; the
+    embedding dimension is covered by BLOCK_D (2D grid when EMBED_DIM > BLOCK_D).
 
     Args:
         grad_ptr: gradient tensor of shape (num_bags, embedding_dim)
         offset2bag_ptr: maps sample position to bag index, shape (num_samples,)
         bag_size_ptr: number of samples in each bag, shape (num_bags,)
-        per_sample_weights_ptr: optional per-sample weights, shape (num_samples,)
+        per_sample_weights_ptr: per-sample weights, shape (num_samples,); only
+            read when HAS_PSW, callers pass any valid tensor otherwise
         values_ptr: output values tensor of shape (nnz, embedding_dim)
-        num_weights: number of rows in embedding table
-        padding_idx: padding index to ignore (samples matching it are pre-filtered
-            on the host, so this kernel only processes valid samples)
-        mode: 0=sum, 1=mean
-        has_per_sample_weights: whether per_sample_weights are provided
-        BLOCK_D: block size for the embedding dimension
+        num_valid_samples: number of valid (non-padding) samples
         EMBED_DIM: embedding dimension
+        MODE: 0=sum, 1=mean
+        HAS_PSW: whether per_sample_weights are provided
+        SAMPLES_PER_PROG: number of samples processed per program
+        BLOCK_D: block size covering the embedding dimension
 
     Note on scaling:
         For mode=0 (sum): value = grad[bag_of_sample]
@@ -69,32 +70,32 @@ def _embedding_bag_sparse_backward_kernel(
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offs_d < EMBED_DIM
 
-    # Load the bag index for this (valid) sample
-    bag_idx = tl.load(offset2bag_ptr + pid).to(tl.int32)
+    for i in tl.static_range(SAMPLES_PER_PROG):
+        pid_s = pid * SAMPLES_PER_PROG + i
+        if pid_s < num_valid_samples:
+            # Load the bag index for this (valid) sample
+            bag_idx = tl.load(offset2bag_ptr + pid_s).to(tl.int32)
 
-    # Load gradient slice for this bag
-    go_ptrs = grad_ptr + bag_idx * EMBED_DIM + offs_d
-    go = tl.load(go_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+            # Load gradient slice for this bag
+            go_ptrs = grad_ptr + bag_idx * EMBED_DIM + offs_d
+            go = tl.load(go_ptrs, mask=mask_d, other=0.0)
 
-    # Compute scale factor based on mode
-    if mode == 1:
-        # mean: divide by bag size
-        bag_size = tl.load(bag_size_ptr + bag_idx).to(tl.float32)
-        bag_size = tl.where(bag_size == 0.0, 1.0, bag_size)
-        scale = 1.0 / bag_size
-    else:
-        scale = 1.0
+            if MODE == 1 or HAS_PSW:
+                go = go.to(tl.float32)
 
-    # Handle per_sample_weights if provided
-    if has_per_sample_weights:
-        pw = tl.load(per_sample_weights_ptr + pid).to(tl.float32)
-        scale = scale * pw
+            if MODE == 1:
+                # mean: divide by bag size
+                bag_size = tl.load(bag_size_ptr + bag_idx).to(tl.float32)
+                bag_size = tl.where(bag_size == 0.0, 1.0, bag_size)
+                go = go * (1.0 / bag_size)
 
-    go = go * scale
+            if HAS_PSW:
+                pw = tl.load(per_sample_weights_ptr + pid_s).to(tl.float32)
+                go = go * pw
 
-    # Store into the output values tensor
-    out_ptrs = values_ptr + pid * EMBED_DIM + offs_d
-    tl.store(out_ptrs, go, mask=mask_d)
+            # Store into the output values tensor
+            out_ptrs = values_ptr + pid_s.to(tl.int64) * EMBED_DIM + offs_d
+            tl.store(out_ptrs, go.to(values_ptr.dtype.element_ty), mask=mask_d)
 
 
 def _embedding_bag_sparse_backward(
@@ -172,7 +173,7 @@ def _embedding_bag_sparse_backward(
 
     nnz = valid_indices.numel()
 
-    # Allocate the dense values buffer; computed in float32 then cast back.
+    # Allocate the dense values buffer.
     grad_dtype = grad.dtype
     values = torch.empty((nnz, D), device=device, dtype=grad_dtype)
 
@@ -182,29 +183,42 @@ def _embedding_bag_sparse_backward(
             sparse_indices, values, (num_weights, D), device=device
         ).coalesce()
 
-    # Triton cannot accept None for a pointer argument, so pass a dummy buffer
-    # when per_sample_weights is absent; it is only read when
-    # has_per_sample_weights is true.
-    if psw_valid is None:
-        psw_valid = torch.empty((nnz,), device=device, dtype=grad_dtype)
+    # Triton cannot accept None for a pointer argument; with HAS_PSW as a
+    # constexpr the pointer is never dereferenced, so reuse `values` as the
+    # placeholder instead of allocating a dummy buffer.
+    psw_arg = psw_valid if psw_valid is not None else values
 
-    # BLOCK_D=128 balances shared-memory occupancy against launch overhead for the
-    # embedding-dim tile; typical embedding dims (64, 128, 256, 512) divide evenly.
-    BLOCK_D = 128
-    grid = (nnz, triton.cdiv(D, BLOCK_D))
+    has_psw = psw_valid is not None
+
+    # One program covers the whole embedding row (single dim tile) whenever it
+    # fits in BLOCK_D=256; wider dims fall back to a 2D grid with BLOCK_D=128.
+    # SAMPLES_PER_PROG=4 amortizes launch/scheduling overhead and reuses the
+    # grad row across samples of the same bag; measured best on H20 for the
+    # [512,256] shape while remaining neutral for small shapes.
+    if D <= 256:
+        BLOCK_D = triton.next_power_of_2(D)
+        SAMPLES_PER_PROG = 4
+        num_warps = 4 if BLOCK_D < 256 else 8
+        grid = (triton.cdiv(nnz, SAMPLES_PER_PROG), 1)
+    else:
+        BLOCK_D = 128
+        SAMPLES_PER_PROG = 1
+        num_warps = 4
+        grid = (nnz, triton.cdiv(D, BLOCK_D))
 
     _embedding_bag_sparse_backward_kernel[grid](
         grad,
         offset2bag_valid,
         bag_size,
-        psw_valid,
+        psw_arg,
         values,
-        num_weights,
-        padding_idx if padding_idx is not None else -1,
-        mode,
-        per_sample_weights is not None,
+        nnz,
+        D,
+        MODE=mode,
+        HAS_PSW=has_psw,
+        SAMPLES_PER_PROG=SAMPLES_PER_PROG,
         BLOCK_D=BLOCK_D,
-        EMBED_DIM=D,
+        num_warps=num_warps,
     )
 
     sparse_indices = valid_indices.unsqueeze(0)
