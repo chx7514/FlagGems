@@ -149,6 +149,32 @@ def test_native_multi_head_attention(monkeypatch, shape, dtype):
 @pytest.mark.native_multi_head_attention
 @pytest.mark.parametrize("shape", MHA_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_native_multi_head_attention_self_attention(monkeypatch, shape, dtype):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    B, T, D, NH = shape
+    query, _, _, qkv_weight, qkv_bias, proj_weight, proj_bias = _make_inputs(
+        B, T, D, NH, dtype
+    )
+    # nn.MultiheadAttention only enters the torch._native_multi_head_attention
+    # fast path when query is key is value, so cover the self-attention branch
+    # where the qkv projection reads a single shared input.
+    res, ref = _run(
+        query,
+        query,
+        query,
+        D,
+        NH,
+        qkv_weight,
+        qkv_bias,
+        proj_weight,
+        proj_bias,
+    )
+    _assert_close(res, ref, dtype)
+
+
+@pytest.mark.native_multi_head_attention
+@pytest.mark.parametrize("shape", MHA_SHAPES)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_native_multi_head_attention_no_weights(monkeypatch, shape, dtype):
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     B, T, D, NH = shape

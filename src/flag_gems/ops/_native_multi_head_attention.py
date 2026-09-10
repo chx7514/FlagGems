@@ -162,6 +162,91 @@ def _mha_attention_kernel(
 
 @libentry()
 @triton.jit
+def _mha_attention_materialized_kernel(
+    Q,
+    K,
+    V,
+    Mask,
+    Out,
+    Weights,
+    scale,
+    T,
+    D,
+    DH,
+    NH,
+    HAS_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Small/medium sequence specialization for need_weights=True. The complete
+    # key dimension fits in one program, so QK is computed only once and the
+    # normalized probabilities are both written to Weights and consumed
+    # directly by P @ V, instead of recomputing QK in a second pass.
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    b = pid_bh // NH
+    h = pid_bh % NH
+    head_offset = h * DH
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    m_mask = offs_m < T
+    n_mask = offs_n < T
+    d_mask = offs_d < DH
+
+    q_ptrs = Q + b * (T * D) + offs_m[:, None] * D + head_offset + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+
+    # Key block [BLOCK_D, BLOCK_N].
+    k_ptrs = K + b * (T * D) + offs_n[None, :] * D + head_offset + offs_d[:, None]
+    k = tl.load(k_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
+
+    qk = tl.dot(q, k, allow_tf32=False) * scale
+
+    if HAS_MASK:
+        mask_ptrs = Mask + pid_bh * (T * T) + offs_m[:, None] * T + offs_n[None, :]
+        mask_vals = tl.load(
+            mask_ptrs,
+            mask=m_mask[:, None] & n_mask[None, :],
+            other=0,
+        )
+        qk = tl.where(mask_vals == 1, float("-inf"), qk)
+
+    # Mask out padding columns beyond T.
+    qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+    # Full-row softmax: no online/recompute pass required.
+    m_i = tl.max(qk, 1)
+    p = tl.where(qk == float("-inf"), 0.0, tl.exp(qk - m_i[:, None]))
+    l_i = tl.sum(p, 1)
+    p = p / l_i[:, None]
+
+    # Store the attention weights immediately.
+    w_ptrs = Weights + pid_bh * (T * T) + offs_m[:, None] * T + offs_n[None, :]
+    tl.store(
+        w_ptrs,
+        p.to(Weights.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+    # Value block [BLOCK_N, BLOCK_D].
+    v_ptrs = V + b * (T * D) + offs_n[:, None] * D + head_offset + offs_d[None, :]
+    v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+    acc = tl.dot(p.to(v.dtype), v, allow_tf32=False)
+
+    o_ptrs = Out + b * (T * D) + offs_m[:, None] * D + head_offset + offs_d[None, :]
+    tl.store(
+        o_ptrs, acc.to(Out.dtype.element_ty), mask=m_mask[:, None] & d_mask[None, :]
+    )
+
+
+@libentry()
+@triton.jit
 def _mha_average_weights_kernel(
     Weights,
     Out,
@@ -207,44 +292,51 @@ def _qkv_projection_kernel(
     Out,
     M,
     D,
+    SELF_ATTENTION: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # Fused query/key/value input projection. Computes the three [M, D] @ [D, D]
-    # GEMMs of the qkv projection in a single kernel launch, writing the results
-    # to three contiguous [M, D] slabs of Out ([3 * M, D]).
+    # Fused query/key/value input projection, parallelized over program_id(2).
+    # Each program computes one [BLOCK_M, BLOCK_N] tile of one of the three
+    # [M, D] @ [D, D] GEMMs, writing the results to three contiguous [M, D]
+    # slabs of Out ([3 * M, D]). This replaces the previous per-CTA serial
+    # loop over Q/K/V, which starved occupancy on small projections.
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+    pid_qkv = tl.program_id(2)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
     mask_n = offs_n < D
 
-    for i in range(3):
-        if i == 0:
+    if SELF_ATTENTION:
+        inp = Q
+    else:
+        if pid_qkv == 0:
             inp = Q
-        elif i == 1:
+        elif pid_qkv == 1:
             inp = K
         else:
             inp = V
-        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        for k in range(0, D, BLOCK_K):
-            k_offsets = k + offs_k
-            in_ptrs = inp + offs_m[:, None] * D + k_offsets[None, :]
-            in_mask = mask_m[:, None] & (k_offsets[None, :] < D)
-            a = tl.load(in_ptrs, mask=in_mask, other=0.0)
-            w_ptrs = W + i * (D * D) + offs_n[None, :] * D + k_offsets[:, None]
-            w_mask = (k_offsets[:, None] < D) & mask_n[None, :]
-            b = tl.load(w_ptrs, mask=w_mask, other=0.0)
-            acc += tl.dot(a, b, allow_tf32=False)
-        bias_ptrs = Bias + i * D + offs_n
-        bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
-        acc = acc + bias[None, :]
-        out_ptrs = Out + i * (M * D) + offs_m[:, None] * D + offs_n[None, :]
-        out_mask = mask_m[:, None] & mask_n[None, :]
-        tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=out_mask)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for k in range(0, D, BLOCK_K):
+        k_offsets = k + offs_k
+        in_ptrs = inp + offs_m[:, None] * D + k_offsets[None, :]
+        in_mask = mask_m[:, None] & (k_offsets[None, :] < D)
+        a = tl.load(in_ptrs, mask=in_mask, other=0.0)
+        w_ptrs = W + pid_qkv * (D * D) + offs_n[None, :] * D + k_offsets[:, None]
+        w_mask = (k_offsets[:, None] < D) & mask_n[None, :]
+        b = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        acc += tl.dot(a, b, allow_tf32=False)
+    bias_ptrs = Bias + pid_qkv * D + offs_n
+    bias = tl.load(bias_ptrs, mask=mask_n, other=0.0)
+    acc = acc + bias[None, :]
+    out_ptrs = Out + pid_qkv * (M * D) + offs_m[:, None] * D + offs_n[None, :]
+    out_mask = mask_m[:, None] & mask_n[None, :]
+    tl.store(out_ptrs, acc.to(Out.dtype.element_ty), mask=out_mask)
 
 
 @libentry()
@@ -346,9 +438,12 @@ def _native_multi_head_attention(
     BLOCK_D = max(16, _next_power_of_2(head_dim))
 
     # qkv projection with bias: a single fused GEMM producing [3*B*T, D] with the
-    # three projections laid out as contiguous [B*T, D] slabs.
+    # three projections laid out as contiguous [B*T, D] slabs. The Q/K/V groups
+    # are parallelized over the third grid dimension; for self-attention all
+    # three groups share the same input (the native MHA fast-path call pattern).
     qkv_out = torch.empty((3 * M, D), dtype=query.dtype, device=query.device)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_N))
+    is_self_attention = query is key and key is value
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(D, BLOCK_N), 3)
     with torch_device_fn.device(query.device):
         _qkv_projection_kernel[grid](
             query,
@@ -359,6 +454,7 @@ def _native_multi_head_attention(
             qkv_out,
             M,
             D,
+            SELF_ATTENTION=is_self_attention,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
@@ -399,27 +495,61 @@ def _native_multi_head_attention(
     else:
         weights = torch.empty((1,), dtype=query.dtype, device=query.device)
 
-    grid = (B * num_head, triton.cdiv(T, BLOCK_M))
+    # Materializing P is unavoidable when need_weights=True. For short/medium
+    # sequences it is cheaper to keep the complete key dimension in one program
+    # and compute QK only once; longer sequences use the streaming kernel.
+    # For FP32 the full-key block is capped at T <= 128: with BLOCK_N=256 the
+    # FMA-path dot blows up register usage and spills, which is slower than
+    # the streaming two-pass kernel.
+    if query.dtype in (torch.float16, torch.bfloat16):
+        use_materialized_kernel = need_weights and T <= 256 and head_dim <= 64
+    else:
+        use_materialized_kernel = need_weights and T <= 128 and head_dim <= 64
+
     with torch_device_fn.device(query.device):
-        _mha_attention_kernel[grid](
-            q,
-            k,
-            v,
-            mask_int8,
-            out,
-            weights,
-            scale,
-            T,
-            D,
-            head_dim,
-            num_head,
-            NEED_WEIGHTS=need_weights,
-            HAS_MASK=has_mask,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-            num_warps=4,
-        )
+        if use_materialized_kernel:
+            ATTN_BLOCK_M = 32 if T <= 128 else 16
+            ATTN_BLOCK_N = max(16, _next_power_of_2(T))
+            grid = (B * num_head, triton.cdiv(T, ATTN_BLOCK_M))
+            _mha_attention_materialized_kernel[grid](
+                q,
+                k,
+                v,
+                mask_int8,
+                out,
+                weights,
+                scale,
+                T,
+                D,
+                head_dim,
+                num_head,
+                HAS_MASK=has_mask,
+                BLOCK_M=ATTN_BLOCK_M,
+                BLOCK_N=ATTN_BLOCK_N,
+                BLOCK_D=BLOCK_D,
+                num_warps=4,
+            )
+        else:
+            grid = (B * num_head, triton.cdiv(T, BLOCK_M))
+            _mha_attention_kernel[grid](
+                q,
+                k,
+                v,
+                mask_int8,
+                out,
+                weights,
+                scale,
+                T,
+                D,
+                head_dim,
+                num_head,
+                NEED_WEIGHTS=need_weights,
+                HAS_MASK=has_mask,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_D=BLOCK_D,
+                num_warps=4,
+            )
 
     # Output projection.
     proj_out = torch.empty((M, D), dtype=query.dtype, device=query.device)
