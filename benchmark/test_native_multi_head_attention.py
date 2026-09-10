@@ -40,10 +40,8 @@ class NativeMultiHeadAttentionBenchmark(base.Benchmark):
         for B, T, D, NH in self.ATTENTION_SHAPES:
             scale = 1.0 / math.sqrt(D)
             query = torch.randn(B, T, D, dtype=dtype, device=self.device)
-            # nn.MultiheadAttention only enters the native fast path when
-            # query is key is value, so benchmark the real call pattern.
-            key = query
-            value = query
+            key = torch.randn(B, T, D, dtype=dtype, device=self.device)
+            value = torch.randn(B, T, D, dtype=dtype, device=self.device)
             qkv_weight = torch.randn(3 * D, D, dtype=dtype, device=self.device) * scale
             qkv_bias = torch.randn(3 * D, dtype=dtype, device=self.device) * scale
             proj_weight = torch.randn(D, D, dtype=dtype, device=self.device) * scale
