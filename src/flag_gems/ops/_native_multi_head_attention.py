@@ -175,6 +175,7 @@ def _mha_attention_materialized_kernel(
     DH,
     NH,
     HAS_MASK: tl.constexpr,
+    TRANSPOSE_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -201,9 +202,18 @@ def _mha_attention_materialized_kernel(
     q_ptrs = Q + b * (T * D) + offs_m[:, None] * D + head_offset + offs_d[None, :]
     q = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
 
-    # Key block [BLOCK_D, BLOCK_N].
-    k_ptrs = K + b * (T * D) + offs_n[None, :] * D + head_offset + offs_d[:, None]
-    k = tl.load(k_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
+    if TRANSPOSE_K:
+        # Coalesced [BLOCK_N, BLOCK_D] load, transposed in registers.
+        k_t = tl.load(
+            K + b * (T * D) + offs_n[:, None] * D + head_offset + offs_d[None, :],
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        k = tl.trans(k_t)
+    else:
+        # [BLOCK_D, BLOCK_N] load with stride-D columns.
+        k_ptrs = K + b * (T * D) + offs_n[None, :] * D + head_offset + offs_d[:, None]
+        k = tl.load(k_ptrs, mask=d_mask[:, None] & n_mask[None, :], other=0.0)
 
     qk = tl.dot(q, k, allow_tf32=False) * scale
 
@@ -256,29 +266,29 @@ def _mha_average_weights_kernel(
     BLOCK_N: tl.constexpr,
 ):
     # Reduce per-head attention weights [B * NH, T, T] down to the
-    # head-averaged [B, T, T] layout in a single fused kernel (sum over heads
-    # followed by division by NH), avoiding two separate elementwise kernels.
+    # head-averaged [B, T, T] layout (sum over heads followed by division by
+    # NH). The grid tiles the full [T, T] output so enough programs are
+    # launched to keep the device busy even for small batch sizes; each
+    # program loops over the NH heads for its own tile.
     pid_b = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    pid_mn = tl.program_id(1)
+    num_n = tl.cdiv(T, BLOCK_N)
+    pid_m = pid_mn // num_n
+    pid_n = pid_mn % num_n
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    for start_n in range(0, T, BLOCK_N):
-        n_offsets = start_n + offs_n
-        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        mask = (offs_m[:, None] < T) & (n_offsets[None, :] < T)
-        for h in range(NH):
-            w_ptrs = (
-                Weights
-                + (pid_b * NH + h) * (T * T)
-                + offs_m[:, None] * T
-                + n_offsets[None, :]
-            )
-            w = tl.load(w_ptrs, mask=mask, other=0.0)
-            acc += w.to(tl.float32)
-        acc = acc * (1.0 / NH)
-        o_ptrs = Out + pid_b * (T * T) + offs_m[:, None] * T + n_offsets[None, :]
-        tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=mask)
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    mask = (offs_m[:, None] < T) & (offs_n[None, :] < T)
+    for h in range(NH):
+        w_ptrs = (
+            Weights + (pid_b * NH + h) * (T * T) + offs_m[:, None] * T + offs_n[None, :]
+        )
+        w = tl.load(w_ptrs, mask=mask, other=0.0)
+        acc += w.to(tl.float32)
+    acc = acc * (1.0 / NH)
+    o_ptrs = Out + pid_b * (T * T) + offs_m[:, None] * T + offs_n[None, :]
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=mask)
 
 
 @libentry()
@@ -508,7 +518,19 @@ def _native_multi_head_attention(
 
     with torch_device_fn.device(query.device):
         if use_materialized_kernel:
-            ATTN_BLOCK_M = 32 if T <= 128 else 16
+            # Block/warp heuristic swept on H20 (78 SMs). Larger BLOCK_M
+            # amortizes the full-key BLOCK_N load; TRANSPOSE_K only wins when
+            # the head slice is wide enough for the coalesced load to pay off
+            # for the QK dot.
+            if head_dim <= 8:
+                ATTN_BLOCK_M, ATTN_WARPS, TRANSPOSE_K = 64, 8, False
+            elif head_dim <= 16:
+                if T <= 128:
+                    ATTN_BLOCK_M, ATTN_WARPS, TRANSPOSE_K = 64, 4, True
+                else:
+                    ATTN_BLOCK_M, ATTN_WARPS, TRANSPOSE_K = 32, 8, True
+            else:
+                ATTN_BLOCK_M, ATTN_WARPS, TRANSPOSE_K = 64, 8, False
             ATTN_BLOCK_N = max(16, _next_power_of_2(T))
             grid = (B * num_head, triton.cdiv(T, ATTN_BLOCK_M))
             _mha_attention_materialized_kernel[grid](
@@ -524,10 +546,11 @@ def _native_multi_head_attention(
                 head_dim,
                 num_head,
                 HAS_MASK=has_mask,
+                TRANSPOSE_K=TRANSPOSE_K,
                 BLOCK_M=ATTN_BLOCK_M,
                 BLOCK_N=ATTN_BLOCK_N,
                 BLOCK_D=BLOCK_D,
-                num_warps=4,
+                num_warps=ATTN_WARPS,
             )
         else:
             grid = (B * num_head, triton.cdiv(T, BLOCK_M))
@@ -572,15 +595,17 @@ def _native_multi_head_attention(
     if need_weights:
         if average_attn_weights:
             avg_weights = torch.empty((B, T, T), dtype=query.dtype, device=query.device)
-            grid = (B, triton.cdiv(T, BLOCK_M))
+            AVG_BLOCK_M = 16
+            AVG_BLOCK_N = 64
+            grid = (B, triton.cdiv(T, AVG_BLOCK_M) * triton.cdiv(T, AVG_BLOCK_N))
             with torch_device_fn.device(query.device):
                 _mha_average_weights_kernel[grid](
                     weights,
                     avg_weights,
                     num_head,
                     T,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
+                    BLOCK_M=AVG_BLOCK_M,
+                    BLOCK_N=AVG_BLOCK_N,
                     num_warps=4,
                 )
             return out, avg_weights
