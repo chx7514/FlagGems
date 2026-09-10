@@ -20,7 +20,10 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import device
+from flag_gems.runtime.common import vendors
 from flag_gems.utils import pointwise_dynamic, tl_extra_shim
+from flag_gems.utils.codegen_config_utils import CodeGenConfig
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +43,19 @@ logger = logging.getLogger(__name__)
 # asymptotically correct and diverges from the reference for the moderate
 # ``alpha`` / near-boundary ``x`` values that occur in practice.
 #
-# All work is done in float32 to match the reference ``accscalar_t``; the
-# result is cast back to the input dtype at the boundary.
+# All work is done in the input dtype (float32/float64) to match the reference
+# ``accscalar_t``; the result is cast back to the input dtype at the boundary.
+#
+# Control-flow structure: the reference is an element-wise ``if -> return``
+# cascade, where a hit branch skips all the later ones.  Triton's ``tl.where``
+# evaluates both sides eagerly, so the previous implementation computed every
+# branch (small / large / mid / rational) for every element and merged with
+# ``tl.where`` -- a large amount of dead computation.  Instead, the piecewise
+# math is expressed as *scalar* functions (real ``if`` control flow, lazy
+# evaluation) and mapped over the tile with ``tl.map_elementwise`` (requires
+# Triton >= 3.6).  Warp-level divergence still exists within a warp, but
+# non-taken branches are no longer unconditionally evaluated and register
+# live ranges shrink considerably.
 # ---------------------------------------------------------------------------
 
 PI = 3.1415926535897932384626433832795028841971
@@ -129,6 +143,26 @@ C1_222 = tl.constexpr(1.097287507e-05)
 C1_223 = tl.constexpr(-1.650969693e-06)
 
 
+# This kernel carries far more per-element state than a typical pointwise op
+# (digamma reflection/series state, the Taylor/saddle-point/rational
+# sub-branches, many coefficient tables), so register pressure grows quickly
+# with the tile size.  On NVIDIA hardware the default 512-wide tile measures
+# measurably slower than a 128-wide 1-D tile (fp32 [64,1024,16]: ~0.22 ms vs
+# ~0.13 ms; fp64 is compute-bound and roughly flat), so use a dedicated
+# config for NVIDIA and keep the vendor default elsewhere.
+_DIRICHLET_GRAD_CONFIG = (
+    CodeGenConfig(
+        128,
+        (65536, 65536, 65536),
+        32,
+        True,
+        prefer_1d_tile=True,
+    )
+    if device.vendor == vendors.NVIDIA
+    else None
+)
+
+
 @triton.jit
 def _div_rn(a, b):
     # IEEE round-to-nearest division.  ``tl.div_rn`` is only available for
@@ -146,42 +180,46 @@ def _div_rn(a, b):
 
 @triton.jit
 def _digamma_one(x):
-    PI: tl.constexpr = 3.1415926535897932384626433832795028841971
-    PSI_10: tl.constexpr = 2.25175258906672110764
     # Cephes-style digamma.  Ported from ATen::native::digamma_one so that the
     # result is bit-for-bit close to the reference implementation used inside
-    # ``dirichlet_grad_one``.  All branching is expressed with ``tl.where``
-    # because the reference operates element-wise on vectors of (x, alpha,
-    # total) tuples.
-    additional_summand = tl.where(
-        x < 0.0,
-        # ``-pi / tan(pi * x)``; use a correctly-rounded division so the
-        # reflection matches the reference ``digamma_one`` rounding.
-        _div_rn(-PI, tl_extra_shim.tan(PI * x)),
-        0.0,
-    )
-    # For x <= 0 the reflection x -> 1 - x is applied; x == 0 or a negative
-    # integer maps to +inf, matching the reference.
-    x_is_integer = x == tl_extra_shim.floor(x)
-    x_nonpos_int = (x <= 0.0) & x_is_integer
-    reflect = x < 0.0
-    xr = tl.where(reflect, 1.0 - x, x)
+    # ``dirichlet_grad_one``.  This is a *scalar* function (evaluated per
+    # element via ``tl.map_elementwise``), so the branches below are real
+    # control flow: expensive math on a non-taken branch is not evaluated.
+    PI: tl.constexpr = 3.1415926535897932384626433832795028841971
+    PSI_10: tl.constexpr = 2.25175258906672110764
 
+    # x == 0 or a negative integer maps to +inf, matching the reference.
+    if x <= 0.0:
+        if x == tl_extra_shim.floor(x):
+            return tl.zeros_like(x) + float("inf")
+
+    additional_summand = tl.zeros_like(x)
+    y = x
+
+    # For x < 0 the reflection x -> 1 - x is applied; ``-pi / tan(pi * x)``
+    # uses a correctly-rounded division so the accumulation matches the
+    # reference ``digamma_one`` rounding.
+    if x < 0.0:
+        additional_summand = _div_rn(-PI, tl_extra_shim.tan(PI * x))
+        y = 1.0 - x
+
+    # Push y to be >= 10 (matches the C++ ``while (y < 10)``).  After the
+    # reflection y is strictly positive, so at most 10 unit increments are
+    # ever needed -- the previous fixed 80-iteration loop evaluated the
+    # division unconditionally on every iteration.
     result = tl.zeros_like(x)
-    y = xr
-    # Push x to be >= 10 (bounded loop, matches the C++ ``while (x < 10)``).
-    # ``tl.div_rn`` (IEEE round-to-nearest) is used for the harmonic sum so the
-    # accumulation matches the reference; Triton's tensor ``/`` is an
-    # approximate 1-ULP division whose error would be amplified by ``1/alpha``
-    # inside the small branch of ``dirichlet_grad_one``.
-    for _ in range(80):
-        m = y < 10.0
-        result = result - tl.where(m, _div_rn(1.0, y), 0.0)
-        y = tl.where(m, y + 1.0, y)
+    for _ in range(10):
+        if y < 10.0:
+            # ``tl.div_rn`` (IEEE round-to-nearest) is used for the harmonic
+            # sum; Triton's tensor ``/`` is an approximate 1-ULP division
+            # whose error would be amplified by ``1/alpha`` inside the small
+            # branch of ``dirichlet_grad_one``.
+            result = result - _div_rn(1.0, y)
+            y = y + 1.0
 
     # Exact value at the loop boundary.
-    is_ten = y == 10.0
-    base = result + PSI_10 + additional_summand
+    if y == 10.0:
+        return result + PSI_10 + additional_summand
 
     # Asymptotic digamma for y > 10.
     a0 = 8.33333333333333333333e-2
@@ -191,18 +229,16 @@ def _digamma_one(x):
     a4 = 3.96825396825396825397e-3
     a5 = -8.33333333333333333333e-3
     a6 = 8.33333333333333333333e-2
-    small = y < 1.0e17
-    z = _div_rn(1.0, y * y)
-    # Horner evaluation of the asymptotic polynomial A[0..6] (Cephes ``polevl``
-    # with degree 6); ``series = z * poly`` reproduces ``y = z * polevl(z, A, 6)``.
-    poly = (((((a6 * z + a5) * z + a4) * z + a3) * z + a2) * z + a1) * z + a0
-    series = tl.where(small, z * poly, 0.0)
-    asympt = (
-        result + tl_extra_shim.log(y) - _div_rn(0.5, y) - series + additional_summand
-    )
-    finite_val = tl.where(is_ten, base, asympt)
-    # x == 0 or negative integer -> +inf (matches the reference).
-    return tl.where(x_nonpos_int, float("inf"), finite_val)
+    series = tl.zeros_like(x)
+    if y < 1.0e17:
+        z = _div_rn(1.0, y * y)
+        # Horner evaluation of the asymptotic polynomial A[0..6] (Cephes
+        # ``polevl`` with degree 6); ``series = z * poly`` reproduces
+        # ``y = z * polevl(z, A, 6)``.
+        poly = (((((a6 * z + a5) * z + a4) * z + a3) * z + a2) * z + a1) * z + a0
+        series = z * poly
+
+    return result + tl_extra_shim.log(y) - _div_rn(0.5, y) - series + additional_summand
 
 
 @triton.jit
@@ -221,8 +257,9 @@ def _beta_grad_alpha_small(x, alpha, beta):
         inv_denom = _div_rn(1.0, denom)
         series = series + _div_rn(numer, denom) * (factor + inv_denom)
     result = x * tl_extra_shim.pow(1.0 - x, -beta) * series
-    nan = result != result
-    return tl.where(nan, 0.0, result)
+    if result != result:
+        return tl.zeros_like(result)
+    return result
 
 
 @triton.jit
@@ -240,8 +277,9 @@ def _beta_grad_beta_small(x, alpha, beta):
         betas = betas * (beta - casted_i)
         series = series + _div_rn(numer, alpha + casted_i) * (dbetas + factor * betas)
     result = -tl_extra_shim.pow(1.0 - x, 1.0 - beta) * series
-    nan = result != result
-    return tl.where(nan, 0.0, result)
+    if result != result:
+        return tl.zeros_like(result)
+    return result
 
 
 @triton.jit
@@ -251,27 +289,37 @@ def _beta_grad_alpha_mid(x, alpha, beta):
     mean = alpha / total
     std = tl_extra_shim.sqrt(alpha * beta / (total + 1.0)) / total
     near_mean = (mean - 0.1 * std <= x) & (x <= mean + 0.1 * std)
-    # Polynomial form valid close to the mode.  ``b2..b4`` are powers of beta;
-    # the Cephes polynomial is, in alpha, degree 4 with descending powers of
-    # beta: beta^4, beta^3, beta^2, beta^1, beta^0 (inside the last factor).
-    b2 = beta * beta
-    b3 = b2 * beta
-    b4 = b2 * b2
-    poly = 47.0 * x * b4 + alpha * (
-        (43.0 + 20.0 * (16.0 + 27.0 * beta) * x) * b3
-        + alpha
-        * (
-            3.0 * (59.0 + 180.0 * beta - 90.0 * x) * b2
+
+    # Real branch: previously both the polynomial form and the (much more
+    # expensive) saddle-point form were computed and selected afterwards with
+    # ``tl.where``.
+    if near_mean:
+        # Polynomial form valid close to the mode.  ``b2..b4`` are powers of
+        # beta; the Cephes polynomial is, in alpha, degree 4 with descending
+        # powers of beta: beta^4, beta^3, beta^2, beta^1, beta^0 (inside the
+        # last factor).
+        b2 = beta * beta
+        b3 = b2 * beta
+        b4 = b2 * b2
+        poly = 47.0 * x * b4 + alpha * (
+            (43.0 + 20.0 * (16.0 + 27.0 * beta) * x) * b3
             + alpha
             * (
-                (453.0 + 1620.0 * beta * (1.0 - x) - 455.0 * x) * beta
-                + alpha * (8.0 * (1.0 - x) * (135.0 * beta - 11.0))
+                3.0 * (59.0 + 180.0 * beta - 90.0 * x) * b2
+                + alpha
+                * (
+                    (453.0 + 1620.0 * beta * (1.0 - x) - 455.0 * x) * beta
+                    + alpha * (8.0 * (1.0 - x) * (135.0 * beta - 11.0))
+                )
             )
         )
-    )
-    prefactor_num = _div_rn((1.0 + 12.0 * alpha) * (1.0 + 12.0 * beta), total * total)
-    prefactor_den = 12960.0 * alpha * alpha * alpha * beta * beta * (1.0 + 12.0 * total)
-    near_mean_val = _div_rn(prefactor_num, (1.0 - x)) * _div_rn(poly, prefactor_den)
+        prefactor_num = _div_rn(
+            (1.0 + 12.0 * alpha) * (1.0 + 12.0 * beta), total * total
+        )
+        prefactor_den = (
+            12960.0 * alpha * alpha * alpha * beta * beta * (1.0 + 12.0 * total)
+        )
+        return _div_rn(prefactor_num, (1.0 - x)) * _div_rn(poly, prefactor_den)
 
     prefactor = _div_rn(-x, tl_extra_shim.sqrt(2.0 * alpha * beta / total))
     stirling = (
@@ -282,6 +330,7 @@ def _beta_grad_alpha_mid(x, alpha, beta):
     term1_num = (
         2.0 * alpha * alpha * (x - 1.0) + alpha * beta * (x - 1.0) - x * (beta * beta)
     )
+    # ``axbx`` is exactly the previous ``term3_den`` expression, computed once.
     axbx = alpha * (x - 1.0) + beta * x
     term1_den = (
         tl_extra_shim.sqrt(2.0 * alpha / beta)
@@ -290,10 +339,11 @@ def _beta_grad_alpha_mid(x, alpha, beta):
         * axbx
     )
     term1 = _div_rn(term1_num, term1_den)
-    term2 = 0.5 * tl_extra_shim.log(_div_rn(alpha, total * x))
+    # ``log(alpha / (total * x))`` is shared by ``term2`` and ``term4_base``.
+    log_a_over_total_x = tl_extra_shim.log(_div_rn(alpha, total * x))
+    term2 = 0.5 * log_a_over_total_x
     term3_num = tl_extra_shim.sqrt(8.0 * alpha * beta / total)
-    term3_den = beta * x + alpha * (x - 1.0)
-    term3 = _div_rn(term3_num, term3_den)
+    term3 = _div_rn(term3_num, axbx)
     # ``term4_base`` is a difference of two large log-terms and is numerically
     # delicate near the mode (it can approach zero, and ``pow(base, -1.5)``
     # amplifies any rounding).  The reference evaluates the quotients in
@@ -302,40 +352,83 @@ def _beta_grad_alpha_mid(x, alpha, beta):
     # ``tl.div_rn`` (correctly rounded) here to reproduce the reference's
     # rounding and keep the saddle-point regime within tolerance.
     log_b_over_total_1mx = tl_extra_shim.log(_div_rn(beta, total * (1.0 - x)))
-    log_a_over_total_x = tl_extra_shim.log(_div_rn(alpha, total * x))
     term4_base = beta * log_b_over_total_1mx + alpha * log_a_over_total_x
     # ``pow(base, -1.5)`` expressed as ``1 / (base * sqrt(base))`` so that the
     # exponent stays in the base's dtype (``tl_extra_shim.pow`` with a python
     # scalar exponent mismatches dtypes for float64).
     term4 = _div_rn(1.0, term4_base * tl_extra_shim.sqrt(term4_base))
-    lt_mean = x < mean
-    term1234 = term1 + term2 * (term3 + tl.where(lt_mean, term4, -term4))
-    far_val = stirling * prefactor * term1234
-    return tl.where(near_mean, near_mean_val, far_val)
+    if x < mean:
+        term1234 = term1 + term2 * (term3 + term4)
+    else:
+        term1234 = term1 + term2 * (term3 - term4)
+    return stirling * prefactor * term1234
 
 
 @triton.jit
 def _dirichlet_grad_one(x, alpha, total):
     # Ported from ATen::native::dirichlet_grad_one (Distributions.h).
+    #
+    # Scalar function: must only be called from ``tl.map_elementwise`` so the
+    # runtime ``if`` statements below operate on individual elements and form
+    # the same ``if -> return`` cascade as the C++ reference (small -> large
+    # -> mid -> rational).  Unselected branches are not evaluated.
     beta = total - alpha
     boundary = total * x * (1.0 - x)
 
-    small_branch = (x <= 0.5) & (boundary < 2.5)
-    res_small = _beta_grad_alpha_small(x, alpha, beta)
+    if (x <= 0.5) & (boundary < 2.5):
+        return _beta_grad_alpha_small(x, alpha, beta)
 
-    large_branch = (x >= 0.5) & (boundary < 0.75)
-    res_large = -_beta_grad_beta_small(1.0 - x, beta, alpha)
+    if (x >= 0.5) & (boundary < 0.75):
+        return -_beta_grad_beta_small(1.0 - x, beta, alpha)
 
     # Saddle-point / near-mean expansion used when both ``alpha`` and ``beta``
-    # are large.  ``_beta_grad_alpha_mid`` internally picks a polynomial form
-    # close to the mode and a saddle-point form away from it.
-    mid_branch = (alpha > 6.0) & (beta > 6.0)
-    res_mid = _beta_grad_alpha_mid(x, alpha, beta)
+    # are large.
+    if (alpha > 6.0) & (beta > 6.0):
+        return _beta_grad_alpha_mid(x, alpha, beta)
 
     # Rational-correction branch (the final fallback in dirichlet_grad_one).
     u = tl_extra_shim.log(x)
     a = tl_extra_shim.log(alpha) - u
     b = tl_extra_shim.log(total) - a
+    # Coefficient tables c[2][3][3][4]: module-level ``tl.constexpr`` tables
+    # ``C0_*`` / ``C1_*`` (see top of file).
+
+    C1_000 = 1.0
+    C1_001 = -0.02924021934
+    C1_002 = -0.04438342661
+    C1_003 = 0.007285809825
+    C1_010 = 0.6357567472
+    C1_011 = -0.3473456711
+    C1_012 = 0.05454656494
+    C1_013 = -0.002407477521
+    C1_020 = -0.03301322327
+    C1_021 = 0.004845219414
+    C1_022 = 0.00231480583
+    C1_023 = -0.0002307248149
+    C1_100 = 0.5925320577
+    C1_101 = -0.1757678135
+    C1_102 = 0.01505928619
+    C1_103 = 0.000564515273
+    C1_110 = 0.1014815858
+    C1_111 = -0.06589186703
+    C1_112 = 0.01272886114
+    C1_113 = -0.0007316646956
+    C1_120 = -0.007258081865
+    C1_121 = 0.001096195486
+    C1_122 = 0.0003934994223
+    C1_123 = -4.12701925e-05
+    C1_200 = 0.06469649321
+    C1_201 = -0.0236701437
+    C1_202 = 0.002902096474
+    C1_203 = -5.896963079e-05
+    C1_210 = 0.001925008108
+    C1_211 = -0.002869809258
+    C1_212 = 0.0008000589141
+    C1_213 = -6.063713228e-05
+    C1_220 = -0.0003477407336
+    C1_221 = 6.95975487e-05
+    C1_222 = 1.097287507e-05
+    C1_223 = -1.650969693e-06
 
     pow_u0 = 1.0
     pow_u1 = u
@@ -347,9 +440,8 @@ def _dirichlet_grad_one(x, alpha, total):
     p = tl.zeros_like(x)
     q = tl.zeros_like(x)
 
-    # Unroll the 3x3 double loop (i, j) explicitly to avoid indexing tuples with
-    # loop variables, which Triton does not support.
-
+    # Unroll the 3x3 double loop (i, j) explicitly to avoid indexing tuples
+    # with loop variables, which Triton does not support.
     ua = pow_u0 * pow_a0
     p = p + ua * (C0_000 + b * (C0_001 + b * (C0_002 + b * C0_003)))
     q = q + ua * (C1_000 + b * (C1_001 + b * (C1_002 + b * C1_003)))
@@ -387,29 +479,24 @@ def _dirichlet_grad_one(x, alpha, total):
     q = q + ua * (C1_220 + b * (C1_221 + b * (C1_222 + b * C1_223)))
 
     approx = _div_rn(x * (_digamma_one(total) - _digamma_one(alpha)), beta)
-    res_rational = _div_rn(p, q) * approx
-
-    # Combine branches with the same priority as the C++ ``if`` cascade:
-    # small -> large -> mid -> rational.
-    result = res_rational
-    result = tl.where(mid_branch, res_mid, result)
-    result = tl.where(large_branch, res_large, result)
-    result = tl.where(small_branch, res_small, result)
-    return result
+    return _div_rn(p, q) * approx
 
 
 @pointwise_dynamic(
     is_tensor=[True, True, True],
     promotion_methods=[(0, 1, 2, "DEFAULT")],
+    config=_DIRICHLET_GRAD_CONFIG,
 )
 @triton.jit
 def _dirichlet_grad_func(x, alpha, total):
-    # The reference ``dirichlet_grad_one`` accumulates in ``accscalar_t`` which
+    # ``pointwise_dynamic`` provides the tensor tile (load / store / mask);
+    # the piecewise implementation runs element by element inside
+    # ``tl.map_elementwise`` so the scalar ``if`` cascade is lazy, matching
+    # ATen's ``gpu_kernel(... dirichlet_grad_one(...))`` structure.  The
+    # reference ``dirichlet_grad_one`` accumulates in ``accscalar_t`` which
     # equals the input dtype (float for float, double for double); the inputs
-    # are already promoted to that dtype by ``pointwise_dynamic``, so compute
-    # in-place rather than forcing float32.
-    out = _dirichlet_grad_one(x, alpha, total)
-    return out.to(x.dtype)
+    # are already promoted to that dtype by ``pointwise_dynamic``.
+    return tl.map_elementwise(_dirichlet_grad_one, x, alpha, total).to(x.dtype)
 
 
 def _dirichlet_grad(x, alpha, total):
