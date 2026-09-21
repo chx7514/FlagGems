@@ -191,20 +191,6 @@ def _nested_tensor_from_mask(t, mask, mask_check=True):
 
     storage_offsets = offsets_cpu[:-1] * D
 
-    # ``_nested_view_from_buffer`` segfaults when any component has zero length
-    # (an upstream NestedTensor bug); the reference aten implementation handles
-    # empty components, so fall back to building the legacy NestedTensor from a
-    # Python list of per-component slices in that case.
-    if bool((lengths_cpu == 0).any().item()):
-        components = [
-            values[
-                int(storage_offsets[n].item()) : int(storage_offsets[n].item())
-                + int(lengths_cpu[n].item()) * D
-            ].view(int(lengths_cpu[n].item()), D)
-            for n in range(N)
-        ]
-        return torch.nested.nested_tensor(components)
-
     return torch.ops.aten._nested_view_from_buffer.default(
         values, nested_size, nested_strides, storage_offsets
     )
