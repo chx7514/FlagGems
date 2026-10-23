@@ -72,16 +72,15 @@ def test_miopen_ctc_loss(shape, dtype):
         ref_log_probs, ref_targets, input_lengths, target_lengths
     )
 
-    with flag_gems.use_gems():
-        res_costs, res_grads = torch.ops.aten.miopen_ctc_loss(
-            res_log_probs,
-            res_targets,
-            input_lengths,
-            target_lengths,
-            0,
-            True,
-            False,
-        )
+    res_costs, res_grads = flag_gems.miopen_ctc_loss(
+        res_log_probs,
+        res_targets,
+        input_lengths,
+        target_lengths,
+        0,
+        True,
+        False,
+    )
 
     assert res_costs.shape == ref_costs.shape
     assert res_grads.shape == ref_log_probs.shape
@@ -107,16 +106,15 @@ def test_miopen_ctc_loss_zero_infinity(dtype):
     res_targets, _ = _make_targets(target_lengths, classes, flag_gems.device)
     input_lengths = [t_steps] * batch
 
-    with flag_gems.use_gems():
-        res_costs, res_grads = torch.ops.aten.miopen_ctc_loss(
-            res_log_probs,
-            res_targets,
-            input_lengths,
-            target_lengths,
-            0,
-            True,
-            True,
-        )
+    res_costs, res_grads = flag_gems.miopen_ctc_loss(
+        res_log_probs,
+        res_targets,
+        input_lengths,
+        target_lengths,
+        0,
+        True,
+        True,
+    )
 
     assert torch.isfinite(res_costs).all()
     assert torch.isfinite(res_grads).all()
@@ -147,16 +145,15 @@ def test_miopen_ctc_loss_empty_target(dtype):
         target_lengths,
     )
 
-    with flag_gems.use_gems():
-        res_costs, res_grads = torch.ops.aten.miopen_ctc_loss(
-            res_log_probs,
-            res_targets,
-            input_lengths,
-            target_lengths,
-            0,
-            True,
-            False,
-        )
+    res_costs, res_grads = flag_gems.miopen_ctc_loss(
+        res_log_probs,
+        res_targets,
+        input_lengths,
+        target_lengths,
+        0,
+        True,
+        False,
+    )
 
     assert finite.all()
     utils.gems_assert_close(res_costs, ref_costs.to(dtype), dtype)
@@ -191,16 +188,15 @@ def test_miopen_ctc_loss_tensor_lengths(dtype):
         target_lengths,
     )
 
-    with flag_gems.use_gems():
-        res_costs, res_grads = flag_gems.miopen_ctc_loss(
-            res_log_probs,
-            res_targets,
-            input_lengths,
-            target_lengths_t,
-            0,
-            True,
-            False,
-        )
+    res_costs, res_grads = flag_gems.miopen_ctc_loss(
+        res_log_probs,
+        res_targets,
+        input_lengths,
+        target_lengths_t,
+        0,
+        True,
+        False,
+    )
 
     assert finite.all()
     utils.gems_assert_close(res_costs, ref_costs.to(dtype), dtype)
@@ -212,6 +208,5 @@ def test_miopen_ctc_loss_invalid_rank():
     """The operator rejects non-3D and non-integer-target inputs."""
     log_probs = torch.log_softmax(torch.randn(8, 4, device=flag_gems.device), dim=-1)
     targets = torch.empty(0, dtype=torch.int32, device=flag_gems.device)
-    with flag_gems.use_gems():
-        with pytest.raises(RuntimeError):
-            torch.ops.aten.miopen_ctc_loss(log_probs, targets, [8], [0], 0, True, False)
+    with pytest.raises(RuntimeError):
+        flag_gems.miopen_ctc_loss(log_probs, targets, [8], [0], 0, True, False)
