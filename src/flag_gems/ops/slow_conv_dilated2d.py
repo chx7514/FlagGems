@@ -316,6 +316,14 @@ def _scd2d_fwd_pd0_kernel(
 
 # ---------------------------------------------------------------------------
 # forward: broadcast-FMA path for fp64 (no tensor-core dot for 64-bit floats)
+#
+# This kernel is a correctness fallback, not a performance path.  Triton has no
+# fp64 dot, so every tap is a scalar broadcast-FMA and the reduction over
+# ``C_in * kH * kW`` is serialised inside each program.  Measured on H20-3e, it
+# is ~9.6-10x slower than the ATen slow reference (im2col followed by an fp64
+# BLAS GEMM) once ``k_tot`` reaches ~864-1152.  Delegating to that reference
+# would violate the no-aten-ops rule, so the loop stays; callers that need fp64
+# throughput at those sizes should stay on the native operator.
 # ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
