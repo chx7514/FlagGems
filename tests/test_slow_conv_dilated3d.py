@@ -55,11 +55,12 @@ def test_slow_conv_dilated3d(case, bias, dtype):
     inp_shape, weight_shape, stride, padding, dilation = case
     if len(inp_shape) == 4 and bias:
         # Upstream aten::slow_conv_dilated3d misindexes the bias in the
-        # unbatched 4-D path (both CPU and CUDA add the wrong bias elements,
-        # verified against F.conv3d), and it raises IndexError when an unbatched
-        # 4-D input is combined with stride > 1 and dilation > 1. The Triton
-        # kernel follows the batched 5-D semantics, so the bias variant of the
-        # unbatched case has no usable ATen baseline.
+        # unbatched 4-D path: both the CPU and CUDA kernels add the wrong bias
+        # elements (verified against F.conv3d), and on CUDA a 4-D input whose
+        # calculated output size is 0 raises IndexError from `select()` instead
+        # of returning an empty tensor. The Triton kernel follows the batched
+        # 5-D semantics, so the bias variant of the unbatched case has no usable
+        # ATen baseline.
         pytest.skip("aten unbatched 4-D + bias path is broken upstream")
     inp = torch.randn(inp_shape, dtype=dtype, device=flag_gems.device)
     weight = torch.randn(weight_shape, dtype=dtype, device=flag_gems.device)
@@ -92,3 +93,211 @@ def test_slow_conv_dilated3d(case, bias, dtype):
     # fp64 im2col + GEMM, so those two need a loosened absolute tolerance.
     atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
     utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
+
+
+def _reference(inp, weight, bias, kernel_size, stride, padding, dilation):
+    """fp64 ATen reference, so the comparison is against a near-exact result."""
+    return torch.ops.aten.slow_conv_dilated3d(
+        utils.to_reference(inp, True),
+        utils.to_reference(weight, True),
+        list(kernel_size),
+        utils.to_reference(bias, True),
+        list(stride),
+        list(padding),
+        list(dilation),
+    )
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_slow_conv_dilated3d_non_contiguous_bias(dtype):
+    """A strided bias view must be read at its own stride, like ATen's
+    `bias.contiguous()` does. Reading `b_ptr + co` directly picks the wrong
+    elements for anything that is not contiguous."""
+    inp = torch.randn((2, 3, 6, 6, 6), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    # Every other element of a 2*Co vector: stride (2,), not the identity.
+    bias = torch.randn(8, dtype=dtype, device=flag_gems.device)[::2]
+    assert bias.stride() == (2,)
+
+    kernel_size = [3, 3, 3]
+    stride = padding = (1, 1, 1)
+    ref_out = _reference(inp, weight, bias, kernel_size, stride, padding, stride).to(
+        dtype
+    )
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias, stride, padding, stride
+    )
+    atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_slow_conv_dilated3d_non_contiguous_input_weight(dtype):
+    """Non-contiguous input and weight are addressed through their strides."""
+    inp_base = torch.randn((2, 3, 7, 6, 6), dtype=dtype, device=flag_gems.device)
+    weight_base = torch.randn((4, 3, 3, 3, 4), dtype=dtype, device=flag_gems.device)
+    inp = inp_base[:, :, :6]
+    weight = weight_base[:, :, :, :, :3]
+    assert not inp.is_contiguous() and not weight.is_contiguous()
+    bias = torch.randn(4, dtype=dtype, device=flag_gems.device)
+
+    kernel_size = [3, 3, 3]
+    stride = padding = (1, 1, 1)
+    ref_out = _reference(inp, weight, bias, kernel_size, stride, padding, stride).to(
+        dtype
+    )
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias, stride, padding, stride
+    )
+    atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_slow_conv_dilated3d_out(dtype):
+    """The explicit `out=` form writes into the caller's buffer."""
+    inp = torch.randn((2, 3, 6, 6, 6), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    bias = torch.randn(4, dtype=dtype, device=flag_gems.device)
+
+    kernel_size = [3, 3, 3]
+    stride = padding = (1, 1, 1)
+    ref_out = _reference(inp, weight, bias, kernel_size, stride, padding, stride).to(
+        dtype
+    )
+
+    out = torch.full(
+        (2, 4, 6, 6, 6), float("nan"), dtype=dtype, device=flag_gems.device
+    )
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias, stride, padding, stride, out=out
+    )
+    assert res_out.data_ptr() == out.data_ptr()
+    atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("bias", [True, False])
+def test_slow_conv_dilated3d_empty_channels(dtype, bias):
+    """`Cin == 0` reduces to nothing, so the result is exactly the bias.
+
+    ATen's own im2col + GEMM path produces the same thing; before this was
+    handled explicitly the kernel returned the contents of an uninitialised
+    `torch.empty`, i.e. arbitrary values.
+    """
+    inp = torch.empty((2, 0, 4, 4, 4), dtype=dtype, device=flag_gems.device)
+    weight = torch.empty((3, 0, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    bias_t = torch.randn(3, dtype=dtype, device=flag_gems.device) if bias else None
+
+    kernel_size = [3, 3, 3]
+    stride, padding = (1, 1, 1), (0, 0, 0)
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias_t, stride, padding, stride
+    )
+    assert tuple(res_out.shape) == (2, 3, 2, 2, 2)
+
+    expected = (
+        bias_t.to(torch.float64).view(1, 3, 1, 1, 1).expand(res_out.shape)
+        if bias
+        else torch.zeros_like(res_out, dtype=torch.float64)
+    )
+    utils.gems_assert_close(
+        res_out,
+        expected.to(dtype),
+        dtype,
+        atol=2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4,
+    )
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_slow_conv_dilated3d_large_kernel(dtype):
+    """kernels above the unroll threshold go through the rolled-loop kernel.
+
+    Uses fp64 only in the reference; the point is that a 5^3 stencil is
+    numerically identical to the unrolled path while compiling in well under a
+    second instead of tens of seconds.
+    """
+    inp = torch.randn((1, 2, 10, 10, 10), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((3, 2, 5, 5, 5), dtype=dtype, device=flag_gems.device)
+    bias = torch.randn(3, dtype=dtype, device=flag_gems.device)
+
+    kernel_size = [5, 5, 5]
+    stride = (1, 1, 1)
+    padding = (2, 2, 2)
+    dilation = (1, 2, 1)
+    ref_out = _reference(inp, weight, bias, kernel_size, stride, padding, dilation).to(
+        dtype
+    )
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias, stride, padding, dilation
+    )
+    atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-4
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
+
+
+@pytest.mark.slow_conv_dilated3d
+@pytest.mark.parametrize(
+    "case",
+    SLOW_CONV_DILATED3D_CASES,
+    ids=[str(c[0]) for c in SLOW_CONV_DILATED3D_CASES],
+)
+def test_slow_conv_dilated3d_fp64(case):
+    """fp64 runs a dedicated scalar-fma kernel (no tensor cores in fp64).
+
+    `utils.FLOAT_DTYPES` deliberately excludes fp64, so without this case the
+    `_conv3d_tap_f64_kernel` branch has no coverage at all.
+    """
+    if not utils.fp64_is_supported:
+        pytest.skip("fp64 is not supported on this backend")
+    inp_shape, weight_shape, stride, padding, dilation = case
+    if len(inp_shape) == 4:
+        # Same upstream 4-D bias bug as the main test; the unbatched case is
+        # already covered for the other dtypes above.
+        pytest.skip("aten unbatched 4-D path is broken upstream")
+    inp = torch.randn(inp_shape, dtype=torch.float64, device=flag_gems.device)
+    weight = torch.randn(weight_shape, dtype=torch.float64, device=flag_gems.device)
+    bias = torch.randn(weight_shape[0], dtype=torch.float64, device=flag_gems.device)
+
+    kernel_size = list(weight_shape[2:])
+    ref_out = _reference(inp, weight, bias, kernel_size, stride, padding, dilation)
+    res_out = flag_gems.slow_conv_dilated3d(
+        inp, weight, kernel_size, bias, stride, padding, dilation
+    )
+    utils.gems_assert_close(res_out, ref_out, torch.float64)
+
+
+@pytest.mark.slow_conv_dilated3d
+def test_slow_conv_dilated3d_invalid_bias():
+    """Bias shape/device are validated before any early return.
+
+    Previously a too-short bias was read out of bounds by the kernel instead of
+    raising, and a zero-length output skipped validation entirely.
+    """
+    inp = torch.randn((2, 3, 6, 6, 6), device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3, 3), device=flag_gems.device)
+
+    with pytest.raises(RuntimeError):
+        flag_gems.slow_conv_dilated3d(
+            inp, weight, [3, 3, 3], torch.randn(5, device=flag_gems.device)
+        )
+    with pytest.raises(RuntimeError):
+        flag_gems.slow_conv_dilated3d(
+            inp, weight, [3, 3, 3], torch.randn((4, 1), device=flag_gems.device)
+        )
+    with pytest.raises(RuntimeError):
+        flag_gems.slow_conv_dilated3d(
+            inp, weight, [3, 3, 3], torch.randn(4)  # bias on CPU
+        )
+    # A zero-sized kernel is rejected, matching ATen.
+    with pytest.raises(RuntimeError):
+        flag_gems.slow_conv_dilated3d(
+            inp,
+            torch.randn((4, 3, 0, 3, 3), device=flag_gems.device),
+            [0, 3, 3],
+        )

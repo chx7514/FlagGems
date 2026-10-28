@@ -30,8 +30,14 @@ from . import base, consts
 # Cout * kD * kH * kW * Do * Ho * Wo elements; larger extents make that buffer
 # outgrow the timed kernel and turn the measurement memory-bound rather than
 # compute-bound. The set spans the small-channel / small-spatial corner the
-# operator is normally used in, a wider 32-channel output, and a strided case.
+# operator is normally used in, a wider 32-channel output, and two 32^3 shapes
+# with the same input/weight extents that differ only in the convolution
+# geometry: case 3 is atrous (dilation 2), case 4 is strided (stride 2). They
+# are deliberately similar in arithmetic intensity; the ~2x latency gap between
+# them comes from the different number of output elements, so the stride and
+# dilation columns are what make the two rows distinguishable.
 SLOW_CONV_DILATED3D_SHAPES = [
+    # (input, weight, stride, padding, dilation)
     ((2, 4, 8, 16, 16), (8, 4, 3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1)),
     ((2, 8, 12, 24, 24), (16, 8, 3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1)),
     ((4, 16, 16, 32, 32), (32, 16, 3, 3, 3), (1, 1, 1), (1, 1, 1), (2, 2, 2)),
