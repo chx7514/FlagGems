@@ -43,6 +43,12 @@ be decomposed with integer division at runtime and whose masked A load costs
 six comparisons per element) this is markedly faster at the small channel
 counts used by this operator.
 
+That unrolling is only worth it for small stencils: compile time grows steeply
+with the tap count (measured on an H20: 3^3 -> 1.9 s, 4^3 -> 9.3 s, 5^3 ->
+37.6 s, 6^3 -> 175 s, 7^3 -> 883 s for a single shape). Kernels above
+``_MAX_UNROLLED_TAPS`` therefore take a rolled-loop variant instead, which
+decomposes the tap index at runtime and keeps compilation bounded.
+
 fp32 uses input_precision="ieee" (the reference is a full-precision im2col +
 SGEMM path); fp16/bf16 accumulate in fp32 and cast only at the store. fp64 has
 no tensor-core path, so it runs a scalar-fma tap kernel in fp64.
@@ -68,6 +74,15 @@ _SUPPORTED_DTYPES = (
 )
 
 logger = logging.getLogger(__name__)
+
+# The tap loop in `_conv3d_tap_kernel` is fully unrolled with `tl.static_range`,
+# which is what makes the small-kernel case fast: every tap becomes straight-line
+# code so the address arithmetic folds into constant offsets. The cost is compile
+# time, which grows steeply with the tap count (measured on an H20: 3^3 -> 1.9 s,
+# 4^3 -> 9.3 s, 5^3 -> 37.6 s, 6^3 -> 175 s, 7^3 -> 883 s for a single shape).
+# Past this many taps we fall back to a rolled loop instead, which costs some
+# runtime performance but keeps compilation bounded.
+_MAX_UNROLLED_TAPS = 64
 
 
 def _triple(value, name):
@@ -153,6 +168,7 @@ def _conv3d_tap_kernel(
     osH,
     osW,
     L,
+    bsCo,
     kD: tl.constexpr,
     kH: tl.constexpr,
     kW: tl.constexpr,
@@ -216,7 +232,137 @@ def _conv3d_tap_kernel(
                         acc = tl.dot(a, bt, acc)
 
     if HAS_BIAS:
-        acc += tl.load(b_ptr + co, mask=mc, other=0.0).to(tl.float32)[None, :]
+        # bias may be a non-contiguous view (e.g. bias[::2]); ATen makes it
+        # contiguous, so honour the caller's stride rather than assuming 1.
+        acc += tl.load(b_ptr + co * bsCo, mask=mc, other=0.0).to(tl.float32)[None, :]
+
+    optr = (
+        o_ptr
+        + n * osN
+        + (co * osCo)[None, :]
+        + (do * osD + ho * osH + wo * osW)[:, None]
+    )
+    tl.store(
+        optr,
+        acc.to(o_ptr.dtype.element_ty),
+        mask=ml[:, None] & mc[None, :],
+    )
+
+
+@triton.jit
+def _conv3d_rolled_kernel(
+    x_ptr,
+    wp_ptr,
+    b_ptr,
+    o_ptr,
+    D,
+    H,
+    W,
+    Cin,
+    Co,
+    Ho,
+    Wo,
+    sD,
+    sH,
+    sW,
+    pD,
+    pH,
+    pW,
+    dD,
+    dH,
+    dW,
+    xsN,
+    xsC,
+    xsD,
+    xsH,
+    xsW,
+    osN,
+    osCo,
+    osD,
+    osH,
+    osW,
+    L,
+    TAPS,
+    bsCo,
+    kD: tl.constexpr,
+    kH: tl.constexpr,
+    kW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    PREC: tl.constexpr,
+    BL: tl.constexpr,
+    BCO: tl.constexpr,
+    BCI: tl.constexpr,
+):
+    """Same arithmetic as `_conv3d_tap_kernel`, but with a rolled tap loop.
+
+    Used when kD*kH*kW is large enough that fully unrolling it would dominate
+    compile time. The tap index is decomposed with integer division at runtime
+    instead, which costs a little throughput but keeps the IR size flat.
+    """
+    pid_l = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    n = tl.program_id(2)
+    HWo = Ho * Wo
+
+    lidx = pid_l * BL + tl.arange(0, BL)
+    ml = lidx < L
+    do = lidx // HWo
+    rem = lidx - do * HWo
+    ho = rem // Wo
+    wo = rem - ho * Wo
+
+    co = pid_c * BCO + tl.arange(0, BCO)
+    mc = co < Co
+
+    rowD = do * sD - pD
+    rowH = ho * sH - pH
+    rowW = wo * sW - pW
+    rowA = rowD * xsD + rowH * xsH + rowW * xsW
+
+    acc = tl.zeros((BL, BCO), dtype=tl.float32)
+    x_base = x_ptr + n * xsN
+
+    KHW: tl.constexpr = kH * kW
+    for tap in range(TAPS):
+        kd = tap // KHW
+        r = tap - kd * KHW
+        kh = r // kW
+        kw = r - kh * kW
+
+        offD = kd * dD
+        offH = kh * dH
+        offW = kw * dW
+        ok = (
+            ml
+            & (rowD + offD >= 0)
+            & (rowD + offD < D)
+            & (rowH + offH >= 0)
+            & (rowH + offH < H)
+            & (rowW + offW >= 0)
+            & (rowW + offW < W)
+        )
+        base = rowA + offD * xsD + offH * xsH + offW * xsW
+        wb = wp_ptr + tap * Cin * Co + co[None, :]
+        for c0 in range(0, Cin, BCI):
+            ci = c0 + tl.arange(0, BCI)
+            mci = ci < Cin
+            a = tl.load(
+                x_base + base[:, None] + (ci * xsC)[None, :],
+                mask=ok[:, None] & mci[None, :],
+                other=0.0,
+            )
+            bt = tl.load(
+                wb + (ci * Co)[:, None],
+                mask=mci[:, None] & mc[None, :],
+                other=0.0,
+            )
+            if PREC == 1:
+                acc = tl.dot(a, bt, acc, input_precision="ieee")
+            else:
+                acc = tl.dot(a, bt, acc)
+
+    if HAS_BIAS:
+        acc += tl.load(b_ptr + co * bsCo, mask=mc, other=0.0).to(tl.float32)[None, :]
 
     optr = (
         o_ptr
@@ -264,6 +410,8 @@ def _conv3d_tap_f64_kernel(
     osH,
     osW,
     L,
+    TAPS,
+    bsCo,
     kD: tl.constexpr,
     kH: tl.constexpr,
     kW: tl.constexpr,
@@ -295,34 +443,43 @@ def _conv3d_tap_f64_kernel(
     acc = tl.zeros((BL, BCO), dtype=tl.float64)
     x_base = x_ptr + n * xsN
 
-    for kd in tl.static_range(kD):
-        id_ = rowD + kd * dD
-        okD = (id_ >= 0) & (id_ < D)
-        for kh in tl.static_range(kH):
-            ih_ = rowH + kh * dH
-            okH = (ih_ >= 0) & (ih_ < H)
-            for kw in tl.static_range(kW):
-                iw_ = rowW + kw * dW
-                ok = ml & okD & okH & (iw_ >= 0) & (iw_ < W)
-                base = (
-                    x_base + rowA + (kd * dD) * xsD + (kh * dH) * xsH + (kw * dW) * xsW
+    # Rolled tap loop: this scalar-gather formulation has no tensor-core path, so
+    # unrolling buys little and costs a lot of compile time on large kernels.
+    KHW: tl.constexpr = kH * kW
+    for tap in range(TAPS):
+        kd = tap // KHW
+        r = tap - kd * KHW
+        kh = r // kW
+        kw = r - kh * kW
+
+        offD = kd * dD
+        offH = kh * dH
+        offW = kw * dW
+        ok = (
+            ml
+            & (rowD + offD >= 0)
+            & (rowD + offD < D)
+            & (rowH + offH >= 0)
+            & (rowH + offH < H)
+            & (rowW + offW >= 0)
+            & (rowW + offW < W)
+        )
+        base = x_base + rowA + offD * xsD + offH * xsH + offW * xsW
+        wb = wp_ptr + tap * Cin * Co
+        for c0 in range(0, Cin, BCI):
+            for j in tl.static_range(BCI):
+                cj = c0 + j
+                mj = ok & (cj < Cin)
+                a = tl.load(base + cj * xsC, mask=mj, other=0.0)
+                bv = tl.load(
+                    wb + cj * Co + co,
+                    mask=(cj < Cin) & mc,
+                    other=0.0,
                 )
-                tap = (kd * kH + kh) * kW + kw
-                wb = wp_ptr + tap * Cin * Co
-                for c0 in range(0, Cin, BCI):
-                    for j in tl.static_range(BCI):
-                        cj = c0 + j
-                        mj = ok & (cj < Cin)
-                        a = tl.load(base + cj * xsC, mask=mj, other=0.0)
-                        bv = tl.load(
-                            wb + cj * Co + co,
-                            mask=(cj < Cin) & mc,
-                            other=0.0,
-                        )
-                        acc += a[:, None] * bv[None, :]
+                acc += a[:, None] * bv[None, :]
 
     if HAS_BIAS:
-        acc += tl.load(b_ptr + co, mask=mc, other=0.0)[None, :]
+        acc += tl.load(b_ptr + co * bsCo, mask=mc, other=0.0)[None, :]
 
     optr = (
         o_ptr
@@ -370,6 +527,10 @@ def slow_conv_dilated3d(
 
     ks = _triple(kernel_size, "kernel_size")
     kD, kH, kW = ks
+    if kD <= 0 or kH <= 0 or kW <= 0:
+        raise RuntimeError(
+            "kernel size should be greater than zero, but got %s" % (list(ks),)
+        )
     if (int(weight.size(2)), int(weight.size(3)), int(weight.size(4))) != ks:
         raise RuntimeError(
             "weight[2:] shape %s must be equal to kernel_size %s"
@@ -412,6 +573,24 @@ def slow_conv_dilated3d(
     if x.dtype not in _SUPPORTED_DTYPES:
         raise RuntimeError("\"slow_conv_dilated3d\" not implemented for '%s'" % x.dtype)
 
+    # Validate bias before any early return: a wrong-length bias used to be read
+    # out of bounds by the kernel, and a length-0 output would silently skip the
+    # validation entirely. ATen checks `bias.dim() == 1` and `bias.size(0) == Co`.
+    has_bias = bias is not None
+    if has_bias:
+        if bias.dim() != 1:
+            raise RuntimeError("bias must be 1D tensor but got %dD tensor" % bias.dim())
+        if int(bias.size(0)) != Co:
+            raise RuntimeError(
+                "Need bias of dimension 1 and bias.size[0] == %d but got input "
+                "to be of shape %s" % (Co, list(bias.shape))
+            )
+        if bias.device != x.device:
+            raise RuntimeError(
+                "bias and input must be on the same device, but got bias on %s "
+                "and input on %s" % (bias.device, x.device)
+            )
+
     out_shape = (Co, Do, Ho, Wo) if unbatched else (N, Co, Do, Ho, Wo)
     if out is None:
         out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
@@ -421,7 +600,22 @@ def slow_conv_dilated3d(
         )
 
     L = Do * Ho * Wo
-    if L == 0 or N == 0 or Co == 0 or Cin == 0:
+    if L == 0 or N == 0 or Co == 0:
+        return out
+    if Cin == 0:
+        # No reduction happens, so every output element is just the bias. Fill it
+        # explicitly instead of leaving torch.empty's contents in place (which is
+        # what ATen's im2col+bias path also produces).
+        if has_bias:
+            # Channel dim is 0 for the unbatched 4-D layout and 1 for 5-D.
+            bias_shape = (
+                ((Co,) + (1,) * (out.dim() - 1))
+                if unbatched
+                else ((1, Co) + (1,) * (out.dim() - 2))
+            )
+            out.copy_(bias.to(x.dtype).view(bias_shape).expand(out_shape))
+        else:
+            out.zero_()
         return out
 
     if unbatched:
@@ -434,8 +628,8 @@ def slow_conv_dilated3d(
         osN, osCo, osD, osH, osW = out.stride()
     wsCo, wsCi, wsKD, wsKH, wsKW = weight.stride()
 
-    has_bias = bias is not None
     b_ptr = bias if has_bias else weight
+    bsCo = bias.stride(0) if has_bias else 1
 
     taps = kD * kH * kW
     wp = torch.empty((taps, Cin, Co), dtype=x.dtype, device=x.device)
@@ -491,6 +685,8 @@ def slow_conv_dilated3d(
             osH,
             osW,
             L,
+            taps,
+            bsCo,
             kD=kD,
             kH=kH,
             kW=kW,
@@ -532,6 +728,55 @@ def slow_conv_dilated3d(
         prec = 1 if x.dtype == torch.float32 else 0
         grid = (triton.cdiv(L, BL), triton.cdiv(Co, BCO), N)
         extra = {} if stages is None else {"num_stages": stages}
+        if taps > _MAX_UNROLLED_TAPS:
+            # Large kernels: a fully unrolled tap loop would take minutes to
+            # compile (see _MAX_UNROLLED_TAPS), so use the rolled variant.
+            _conv3d_rolled_kernel[grid](
+                x,
+                wp,
+                b_ptr,
+                out,
+                D,
+                H,
+                W,
+                Cin,
+                Co,
+                Ho,
+                Wo,
+                sD,
+                sH,
+                sW,
+                pD,
+                pH,
+                pW,
+                dD,
+                dH,
+                dW,
+                xsN,
+                xsC,
+                xsD,
+                xsH,
+                xsW,
+                osN,
+                osCo,
+                osD,
+                osH,
+                osW,
+                L,
+                taps,
+                bsCo,
+                kD=kD,
+                kH=kH,
+                kW=kW,
+                HAS_BIAS=has_bias,
+                PREC=prec,
+                BL=BL,
+                BCO=BCO,
+                BCI=BCI,
+                num_warps=warps,
+                **extra,
+            )
+            return out
         _conv3d_tap_kernel[grid](
             x,
             wp,
@@ -564,6 +809,7 @@ def slow_conv_dilated3d(
             osH,
             osW,
             L,
+            bsCo,
             kD=kD,
             kH=kH,
             kW=kW,
