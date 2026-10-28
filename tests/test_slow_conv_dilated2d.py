@@ -117,6 +117,7 @@ def test_slow_conv_dilated2d_projection(dtype):
     utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
 
 
+@pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_out_overload(dtype):
@@ -139,6 +140,7 @@ def test_slow_conv_dilated2d_out_overload(dtype):
     utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
 
 
+@pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_out_resize(dtype):
@@ -225,6 +227,7 @@ def test_slow_conv_dilated2d_unbatched(dtype):
     assert torch.equal(res_out, res_batched[0])
 
 
+@pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_unbatched_out(dtype):
@@ -367,6 +370,7 @@ def test_slow_conv_dilated2d_empty(dtype):
     assert res_out.numel() == 0
 
 
+@pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_noncontiguous_out(dtype):
@@ -403,6 +407,7 @@ def test_slow_conv_dilated2d_noncontiguous_out(dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_out_dispatch(dtype):
