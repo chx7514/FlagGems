@@ -197,11 +197,15 @@ def test_slow_conv_dilated2d_dispatch():
         assert cuda_entries, "no CUDA kernel registered for the .out overload"
 
         # Dispatch through ``torch.ops.aten`` so the check cannot pass on the
-        # Python entry point alone.
+        # Python entry point alone.  The reference is built with
+        # ``utils.to_reference`` so it lands on CPU under TO_CPU, which is what
+        # ``gems_assert_close`` expects there.
         inp = torch.randn((2, 3, 9, 9), dtype=torch.float32, device=flag_gems.device)
         weight = torch.randn((4, 3, 3, 3), dtype=torch.float32, device=flag_gems.device)
+        ref_inp = utils.to_reference(inp, True)
+        ref_weight = utils.to_reference(weight, True)
         ref_out = torch.ops.aten.slow_conv_dilated2d(
-            inp.double(), weight.double(), [3, 3], None, [1, 1], [1, 1], [2, 2]
+            ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
         )
         out_buf = torch.empty(
             (2, 4, 7, 7), dtype=torch.float32, device=flag_gems.device
