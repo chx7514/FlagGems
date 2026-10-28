@@ -51,15 +51,20 @@ DILATIONS = [(1, 1), (2, 2)]
 
 # Low-precision convolution accumulates a long reduction chain over
 # C_in * kH * kW taps, so fp16/bf16 outputs drift from the fp64 reference well
-# beyond the framework's default 1e-4 absolute tolerance.
+# beyond the framework's default 1e-4 absolute tolerance.  fp64 is checked
+# against the same fp64 reference through the broadcast-FMA kernel, so it only
+# has to absorb the reassociation of the tap order (a few ulp of an fp64 sum).
 LOW_PRECISION_ATOL = 2e-2
+FP64_ATOL = 1e-10
 DEFAULT_ATOL = 1e-4
 
 
 def _atol(dtype):
-    return (
-        LOW_PRECISION_ATOL if dtype in (torch.float16, torch.bfloat16) else DEFAULT_ATOL
-    )
+    if dtype in (torch.float16, torch.bfloat16):
+        return LOW_PRECISION_ATOL
+    if dtype == torch.float64:
+        return FP64_ATOL
+    return DEFAULT_ATOL
 
 
 @pytest.mark.slow_conv_dilated2d
@@ -68,7 +73,7 @@ def _atol(dtype):
 @pytest.mark.parametrize("padding", PADDINGS)
 @pytest.mark.parametrize("dilation", DILATIONS)
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d(
     shape_input, shape_weight, kernel, stride, padding, dilation, bias, dtype
 ):
@@ -95,7 +100,7 @@ def test_slow_conv_dilated2d(
 
 
 @pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_projection(dtype):
     """1 x 1 unit-stride unpadded kernel: the specialised plain-GEMM path."""
     inp = torch.randn((3, 5, 6, 7), dtype=dtype, device=flag_gems.device)
@@ -113,7 +118,7 @@ def test_slow_conv_dilated2d_projection(dtype):
 
 
 @pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
 def test_slow_conv_dilated2d_out_overload(dtype):
     """The ``out=`` overload writes into the caller's buffer and returns it."""
     inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
@@ -132,3 +137,348 @@ def test_slow_conv_dilated2d_out_overload(dtype):
 
     assert res_out is out_buf
     utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_out_resize(dtype):
+    """``out=`` resizes a wrongly shaped destination, as ATen's overload does."""
+    inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
+    )
+
+    # An empty buffer is what ``torch.empty(0)`` callers pass; ATen's ``.out``
+    # contract resizes it to the required shape rather than raising.
+    out_buf = torch.empty(0, dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.ops.slow_conv_dilated2d_out(
+        inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
+    )
+
+    assert res_out.shape == (2, 4, 7, 7)
+    assert out_buf.shape == (2, 4, 7, 7)
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+def test_slow_conv_dilated2d_wide_tile_selection():
+    """The wide tile is chosen only for wide planes with a short contraction.
+
+    ``_tap_tile`` selects the (128, 64) tile when the plane exceeds
+    ``_WIDE_PLANE`` *and* ``k_tot`` stays within ``_WIDE_K_TOT``.  Both
+    conditions matter: a wide plane with a long contraction must keep the
+    narrow tile, which is 1-30% faster there.
+    """
+    from flag_gems.ops.slow_conv_dilated2d import _WIDE_K_TOT, _WIDE_PLANE, _tap_tile
+
+    wide_plane = _WIDE_PLANE + 1
+    short_k = _WIDE_K_TOT
+    long_k = 288
+
+    # wide plane + short contraction -> (128, ...) tile
+    assert _tap_tile(False, 64, wide_plane, short_k)[1] == 128
+    # wide plane + long contraction -> narrow tile
+    assert _tap_tile(False, 64, wide_plane, long_k)[1] == 64
+    # narrow plane + short contraction -> narrow tile
+    assert _tap_tile(False, 64, _WIDE_PLANE, short_k)[1] == 64
+
+
+# ---------------------------------------------------------------------------
+# Unbatched (3-D) input
+#
+# ATen's schema admits a (C_in, H, W) plane and returns (C_out, H_out, W_out).
+# The wrapper materialises the batch axis before the launch, so the strongest
+# check is that the 3-D result is exactly the batch-0 slice of the equivalent
+# 4-D call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_unbatched(dtype):
+    """3-D input matches ATen and the 4-D call's only batch element."""
+    x3 = torch.randn((3, 8, 8), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    ref_x3 = utils.to_reference(x3, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_x3, ref_weight, [3, 3], None, [1, 1], [0, 0], [1, 1]
+    )
+    assert ref_out.shape == (4, 6, 6)
+
+    res_out = flag_gems.slow_conv_dilated2d(
+        x3, weight, [3, 3], None, [1, 1], [0, 0], [1, 1]
+    )
+    assert res_out.shape == (4, 6, 6)
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+    res_batched = flag_gems.slow_conv_dilated2d(
+        x3.unsqueeze(0), weight, [3, 3], None, [1, 1], [0, 0], [1, 1]
+    )
+    # Same kernel, same batch axis: the unbatched result is bit-identical to the
+    # batch-0 slice, not merely close.
+    assert torch.equal(res_out, res_batched[0])
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_unbatched_out(dtype):
+    """A 3-D ``out=`` buffer is written in place and returned unchanged."""
+    x3 = torch.randn((3, 9, 9), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    ref_x3 = utils.to_reference(x3, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_x3, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
+    )
+    assert ref_out.shape == (4, 7, 7)
+
+    out_buf = torch.empty((4, 7, 7), dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.ops.slow_conv_dilated2d_out(
+        x3, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
+    )
+
+    # ATen returns the very object the caller passed, so the same identity
+    # contract holds here rather than only sharing storage.
+    assert res_out is out_buf
+    assert res_out.shape == (4, 7, 7)
+    assert out_buf.shape == (4, 7, 7)
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+# ---------------------------------------------------------------------------
+# Geometry and layout edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_negative_padding(dtype):
+    """Negative padding crops the border instead of zero-extending it."""
+    inp = torch.randn((2, 3, 8, 8), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_inp, ref_weight, [3, 3], None, [1, 1], [-1, -1], [1, 1]
+    )
+    res_out = flag_gems.slow_conv_dilated2d(
+        inp, weight, [3, 3], None, [1, 1], [-1, -1], [1, 1]
+    )
+
+    assert res_out.shape == (2, 4, 4, 4)
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_non_square_geometry(dtype):
+    """Non-square kernels and per-axis stride/padding/dilation are not transposed."""
+    inp = torch.randn((2, 3, 9, 11), dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+
+    for (k_h, k_w), stride, padding, dilation in [
+        ((1, 2), [1, 1], [1, 1], [1, 1]),
+        ((3, 1), [1, 1], [1, 1], [1, 1]),
+        ((2, 3), [1, 1], [1, 1], [1, 1]),
+        ((3, 3), [1, 2], [0, 0], [1, 1]),
+        ((3, 3), [2, 1], [1, 0], [1, 2]),
+    ]:
+        weight = torch.randn((4, 3, k_h, k_w), dtype=dtype, device=flag_gems.device)
+        ref_weight = utils.to_reference(weight, True)
+        ref_out = torch.ops.aten.slow_conv_dilated2d(
+            ref_inp, ref_weight, [k_h, k_w], None, stride, padding, dilation
+        )
+        res_out = flag_gems.slow_conv_dilated2d(
+            inp, weight, [k_h, k_w], None, stride, padding, dilation
+        )
+        assert res_out.shape == ref_out.shape
+        utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_strided_input(dtype):
+    """A transposed spatial plane exercises the non-unit input strides."""
+    inp = torch.randn((2, 3, 8, 9), dtype=dtype, device=flag_gems.device).transpose(
+        2, 3
+    )
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    assert not inp.is_contiguous()
+    ref_inp = utils.to_reference(inp, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [1, 1]
+    )
+    res_out = flag_gems.slow_conv_dilated2d(
+        inp, weight, [3, 3], None, [1, 1], [1, 1], [1, 1]
+    )
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_channels_last(dtype):
+    """Channels-last input keeps its NHWC strides and is still correct."""
+    inp = torch.randn((2, 3, 8, 8), dtype=dtype, device=flag_gems.device).to(
+        memory_format=torch.channels_last
+    )
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    assert inp.is_contiguous(memory_format=torch.channels_last)
+    ref_inp = utils.to_reference(inp, True)
+    ref_weight = utils.to_reference(weight, True)
+
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [1, 1]
+    )
+    res_out = flag_gems.slow_conv_dilated2d(
+        inp, weight, [3, 3], None, [1, 1], [1, 1], [1, 1]
+    )
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_empty(dtype):
+    """Empty batch and empty output-channel sets produce empty results.
+
+    ``c_in == 0`` is deliberately *not* covered: ATen's own reference path has
+    no comparable behaviour there, so there is nothing to compare against.
+    """
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+
+    inp = torch.randn((0, 3, 8, 8), dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.slow_conv_dilated2d(inp, weight, [3, 3], None, [1, 1], [1, 1])
+    assert res_out.shape == (0, 4, 8, 8)
+    assert res_out.numel() == 0
+
+    inp = torch.randn((2, 3, 8, 8), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((0, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.slow_conv_dilated2d(inp, weight, [3, 3], None, [1, 1], [1, 1])
+    assert res_out.shape == (2, 0, 8, 8)
+    assert res_out.numel() == 0
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_noncontiguous_out(dtype):
+    """A non-contiguous ``out`` keeps its layout, identity and values."""
+    inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+    ref_inp = utils.to_reference(inp, True)
+    ref_weight = utils.to_reference(weight, True)
+    ref_out = torch.ops.aten.slow_conv_dilated2d(
+        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
+    )
+
+    # (N, C_out, H_out, W_out) laid out with the last two axes transposed.
+    out_buf = torch.empty((2, 4, 7, 7), dtype=dtype, device=flag_gems.device).transpose(
+        2, 3
+    )
+    assert not out_buf.is_contiguous()
+    res_out = flag_gems.ops.slow_conv_dilated2d_out(
+        inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
+    )
+
+    assert res_out is out_buf
+    assert res_out.stride() == out_buf.stride()
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+
+
+# ---------------------------------------------------------------------------
+# Dispatch coverage for the .out overload
+#
+# The tests above call the FlagGems entry points directly.  To prove that the
+# ``aten::slow_conv_dilated2d.out`` overload registered in ``_FULL_CONFIG`` is
+# actually reachable, dispatch through ``torch.ops.aten`` inside a registrar
+# scope.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow_conv_dilated2d
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_slow_conv_dilated2d_out_dispatch(dtype):
+    """``torch.ops.aten.slow_conv_dilated2d.out`` lands on the GEMS kernel."""
+    library = torch.library.Library("aten", "IMPL")
+    previous_registrar = flag_gems.current_work_registrar
+    try:
+        flag_gems.only_enable(
+            lib=library,
+            include=["slow_conv_dilated2d_out"],
+            registrar=flag_gems.GeneralOpRegistrar,
+        )
+        # The native operator only has a CompositeExplicitAutograd entry, so a
+        # CUDA implementation appearing in the dump -- and the key being listed
+        # by the active registrar -- is what proves the new overload landed.
+        cuda_entries = [
+            line
+            for line in torch._C._dispatch_dump(
+                "aten::slow_conv_dilated2d.out"
+            ).splitlines()
+            if line.startswith("CUDA:")
+        ]
+        assert cuda_entries, "no CUDA kernel registered for the .out overload"
+        assert "slow_conv_dilated2d.out" in flag_gems.all_registered_keys()
+
+        inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
+        weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
+        ref_inp = utils.to_reference(inp, True)
+        ref_weight = utils.to_reference(weight, True)
+        ref_out = torch.ops.aten.slow_conv_dilated2d(
+            ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
+        )
+
+        out_buf = torch.empty((2, 4, 7, 7), dtype=dtype, device=flag_gems.device)
+        res_out = torch.ops.aten.slow_conv_dilated2d.out(
+            inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
+        )
+
+        assert res_out is out_buf
+        utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+    finally:
+        if hasattr(library, "_destroy"):
+            library._destroy()
+        flag_gems.current_work_registrar = previous_registrar
+
+
+@pytest.mark.slow_conv_dilated2d
+def test_slow_conv_dilated2d_symint_pair():
+    """``_as_pair`` accepts ``torch.SymInt`` elements, as the schema declares.
+
+    The ATen schema types ``kernel_size`` / ``stride`` / ``padding`` /
+    ``dilation`` as ``SymInt[2]``, so under ``torch.compile`` the elements can
+    arrive as ``torch.SymInt``.  ``SymInt`` is not an ``int`` subclass, so a
+    plain ``isinstance(x, int)`` check rejects them.
+    """
+    from flag_gems.ops.slow_conv_dilated2d import _as_pair
+
+    assert not issubclass(torch.SymInt, int)
+
+    assert _as_pair([3, 3], "kernel_size") == (3, 3)
+    assert _as_pair(3, "kernel_size") == (3, 3)
+    # bools stay rejected even though bool is an int subclass.
+    with pytest.raises(RuntimeError):
+        _as_pair([True, True], "kernel_size")
+
+
+@pytest.mark.slow_conv_dilated2d
+def test_slow_conv_dilated2d_error_message():
+    """Oversized kernels and over-cropping padding raise a clear error."""
+    inp = torch.randn((1, 3, 2, 2), device=flag_gems.device)
+    weight = torch.randn((4, 3, 3, 3), device=flag_gems.device)
+    with pytest.raises(RuntimeError, match="calculated output size"):
+        flag_gems.slow_conv_dilated2d(inp, weight, [3, 3], None, [1, 1], [0, 0], [1, 1])
+
+    inp = torch.randn((1, 3, 8, 8), device=flag_gems.device)
+    with pytest.raises(RuntimeError, match="calculated output size"):
+        flag_gems.slow_conv_dilated2d(
+            inp, weight, [3, 3], None, [1, 1], [-5, -5], [1, 1]
+        )

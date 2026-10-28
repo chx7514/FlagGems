@@ -65,6 +65,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.utils import libentry
+
 logger = logging.getLogger(__name__)
 
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -76,10 +78,21 @@ _MIN_TILE = 16
 # (128, 64) tiles pay off.  Fixed by tile sweeps on the H20-3e target.
 _WIDE_PLANE = 65536
 
+# Contraction length (C_in * kH * kW) beyond which the wide tile loses to the
+# narrow one even on a wide plane.  The wide tile hoists more of the gather out
+# of the K loop, which only pays while that loop is short; once ``k_tot`` grows
+# the extra register pressure costs more than it saves.  Measured on H20-3e at
+# plane ~ 1e5-2.6e5: with k_tot = 36 the wide tile is 4-11% faster, while at
+# k_tot = 288 it is 1-30% slower depending on c_out (worst at c_out = 128).
+# The crossover sits around k_tot ~ 144-216, so 128 keeps the wins and drops
+# every loss.
+_WIDE_K_TOT = 128
+
 
 # ---------------------------------------------------------------------------
 # forward: general dilated path (implicit GEMM over ci * kH * kW)
 # ---------------------------------------------------------------------------
+@libentry()
 @triton.jit
 def _scd2d_fwd_kernel(
     x_ptr,
@@ -229,6 +242,7 @@ def _scd2d_fwd_kernel(
 # ---------------------------------------------------------------------------
 # forward: 1x1 kernel, unit stride, no padding (plain GEMM over C_in)
 # ---------------------------------------------------------------------------
+@libentry()
 @triton.jit
 def _scd2d_fwd_pd0_kernel(
     x_ptr,
@@ -303,6 +317,7 @@ def _scd2d_fwd_pd0_kernel(
 # ---------------------------------------------------------------------------
 # forward: broadcast-FMA path for fp64 (no tensor-core dot for 64-bit floats)
 # ---------------------------------------------------------------------------
+@libentry()
 @triton.jit
 def _scd2d_fwd_f64_kernel(
     x_ptr,
@@ -383,20 +398,30 @@ def _scd2d_fwd_f64_kernel(
 # host side
 # ---------------------------------------------------------------------------
 def _as_pair(value, name, positive=False, allow_negative=True):
-    """Normalise an int or a two-element sequence into a pair of python ints."""
-    if value is None or isinstance(value, bool):
+    """Normalise an int or a two-element sequence into a pair of python ints.
+
+    The ATen schema types these arguments as ``SymInt[2]``, so under
+    ``torch.compile`` an element can arrive as ``torch.SymInt`` rather than a
+    plain ``int``.  ``SymInt`` is *not* an ``int`` subclass, but it converts via
+    ``int()`` once it has a concrete value, which is the case for the geometry
+    the kernels need: they are passed as constexprs, so the launch already
+    requires a concrete value.
+    """
+    if isinstance(value, bool):
         raise RuntimeError("%s must be an int or a pair of ints" % name)
-    if isinstance(value, int):
+    if isinstance(value, (int, torch.SymInt)):
         items = [value, value]
     elif isinstance(value, (list, tuple)):
         items = list(value)
         if len(items) != 2:
             raise RuntimeError("%s must have exactly two elements" % name)
+    elif value is None:
+        raise RuntimeError("%s must be an int or a pair of ints" % name)
     else:
         raise RuntimeError("%s must be an int or a pair of ints" % name)
     out = []
     for item in items:
-        if isinstance(item, bool) or not isinstance(item, int):
+        if isinstance(item, bool) or not isinstance(item, (int, torch.SymInt)):
             raise RuntimeError("%s must contain plain integers" % name)
         item = int(item)
         if positive and item < 1:
@@ -410,8 +435,14 @@ def _as_pair(value, name, positive=False, allow_negative=True):
 def _validate(x, weight, kernel_size, bias, stride, padding, dilation, out):
     if not torch.is_tensor(x) or not torch.is_tensor(weight):
         raise RuntimeError("slow_conv_dilated2d requires tensor inputs")
-    if x.ndim != 4 or weight.ndim != 4:
-        raise RuntimeError("slow_conv_dilated2d expects 4-D input and weight")
+    # ATen accepts an unbatched (C_in, H, W) input as well as (N, C_in, H, W);
+    # the weight is always 4-D.  ``unbatched`` tells the caller to materialise
+    # the batch axis before the launch and to remove it from the result.
+    if x.ndim not in (3, 4) or weight.ndim != 4:
+        raise RuntimeError(
+            "slow_conv_dilated2d expects 3-D or 4-D input and 4-D weight"
+        )
+    unbatched = x.ndim == 3
     if x.dtype not in _FLOAT_DTYPES or weight.dtype not in _FLOAT_DTYPES:
         raise RuntimeError(
             "slow_conv_dilated2d supports float16/float32/bfloat16/float64"
@@ -426,7 +457,8 @@ def _validate(x, weight, kernel_size, bias, stride, padding, dilation, out):
     p_h, p_w = _as_pair(padding, "padding")
     d_h, d_w = _as_pair(dilation, "dilation", positive=True)
 
-    n, c_in, h, w = x.shape
+    c_in, h, w = x.shape[-3:]
+    n = 1 if unbatched else x.shape[0]
     c_out, wc, wk_h, wk_w = weight.shape
     if wc != c_in:
         raise RuntimeError("weight and input must agree on the channel count")
@@ -436,7 +468,14 @@ def _validate(x, weight, kernel_size, bias, stride, padding, dilation, out):
     h_out = (h + 2 * p_h - d_h * (k_h - 1) - 1) // s_h + 1
     w_out = (w + 2 * p_w - d_w * (k_w - 1) - 1) // s_w + 1
     if h_out < 1 or w_out < 1:
-        raise RuntimeError("kernel size is larger than the input")
+        # The effective kernel extent can exceed the padded input either because
+        # the kernel really is too large or because a negative padding cropped
+        # more than was left; name both so the message is not misleading.
+        raise RuntimeError(
+            "calculated output size %d %d is too small: kernel extent "
+            "(dilation * (kernel_size - 1) + 1) exceeds the padded input "
+            "(%d, %d) including padding (%d, %d)" % (h_out, w_out, h, w, p_h, p_w)
+        )
 
     if bias is not None:
         if not torch.is_tensor(bias) or bias.ndim != 1:
@@ -446,15 +485,34 @@ def _validate(x, weight, kernel_size, bias, stride, padding, dilation, out):
         if bias.dtype not in _FLOAT_DTYPES:
             raise RuntimeError("unsupported bias dtype")
 
+    # The destination mirrors the input rank: (C_out, H_out, W_out) for an
+    # unbatched call, (N, C_out, H_out, W_out) otherwise.
+    expected = (c_out, h_out, w_out) if unbatched else (n, c_out, h_out, w_out)
     if out is not None:
-        if not torch.is_tensor(out) or out.ndim != 4:
-            raise RuntimeError("out must be a 4-D tensor")
-        if tuple(out.shape) != (n, c_out, h_out, w_out):
-            raise RuntimeError("out has the wrong shape")
+        if not torch.is_tensor(out):
+            raise RuntimeError("out must be a tensor")
+        # ATen's ``.out`` overload resizes the destination to the required shape
+        # (the same ``resize_output`` contract every ``.out`` op follows), so an
+        # empty or wrongly shaped buffer is legal and is rewritten in place.
+        # Only dtype and device have to agree up front.
         if out.dtype != x.dtype or out.device != x.device:
             raise RuntimeError("out must match the input dtype and device")
+        if tuple(out.shape) != expected:
+            out.resize_(expected)
 
-    return (k_h, k_w, s_h, s_w, p_h, p_w, d_h, d_w, h_out, w_out)
+    return (
+        k_h,
+        k_w,
+        s_h,
+        s_w,
+        p_h,
+        p_w,
+        d_h,
+        d_w,
+        h_out,
+        w_out,
+        unbatched,
+    )
 
 
 def _pow2(value, low, high):
@@ -482,8 +540,10 @@ def _tap_tile(is_fp32, c_out, plane, k_tot):
         block_k = min(64 if k_tot >= 3072 else 32, k_lim)
         return block_co, 128, block_k, warps, ab_tiles
     # Low precision (tensor cores): the wide (128, 64) tile wins only on large
-    # planes; everywhere else the smaller (64, 32) tile is better or equal.
-    if plane > _WIDE_PLANE:
+    # planes with a short contraction; with a long K loop the narrow (64, 32)
+    # tile is better or equal.  Both conditions are required -- plane alone
+    # picks the wide tile at k_tot >= 288 where it is 1-30% slower.
+    if plane > _WIDE_PLANE and k_tot <= _WIDE_K_TOT:
         block_m, block_k = 128, (64 if k_tot % 64 == 0 else 32)
     else:
         block_m, block_k = 64, 32
@@ -491,7 +551,7 @@ def _tap_tile(is_fp32, c_out, plane, k_tot):
 
 
 def _launch(x, weight, bias, out, dims):
-    k_h, k_w, s_h, s_w, p_h, p_w, d_h, d_w, h_out, w_out = dims
+    k_h, k_w, s_h, s_w, p_h, p_w, d_h, d_w, h_out, w_out, _unbatched = dims
     n, c_in, h, w = x.shape
     c_out = weight.shape[0]
     hw_out = h_out * w_out
@@ -631,6 +691,69 @@ def _launch(x, weight, bias, out, dims):
     return out
 
 
+def _run(self, weight, kernel_size, bias, stride, padding, dilation, out):
+    """Shared body of the value-returning and ``.out`` entry points.
+
+    The ATen dispatcher elides trailing arguments equal to the schema defaults
+    (``stride=[1, 1]``, ``padding=[0, 0]``, ``dilation=[1, 1]``), so a Python
+    implementation registered via ``lib.impl`` observes them as ``None`` even
+    when the caller passed them explicitly; the same holds when the caller
+    omits them. ``_as_pair`` rejects ``None``, so apply the documented ATen
+    defaults here, mirroring ``avg_pool2d._parse_pool_params`` upstream.
+    """
+    x = self
+    if stride is None:
+        stride = [1, 1]
+    if padding is None:
+        padding = [0, 0]
+    if dilation is None:
+        dilation = [1, 1]
+    dims = _validate(x, weight, kernel_size, bias, stride, padding, dilation, out)
+    (
+        _k_h,
+        _k_w,
+        _s_h,
+        _s_w,
+        _p_h,
+        _p_w,
+        _d_h,
+        _d_w,
+        h_out,
+        w_out,
+        unbatched,
+    ) = dims
+
+    # An unbatched (C_in, H, W) input, and the matching (C_out, H_out, W_out)
+    # destination, gain a leading batch axis here so ``_launch`` and the kernels
+    # only ever see the batched layout.  The destination and the result lose
+    # that axis again at the end, which keeps a 3-D ``out=`` buffer intact and
+    # returns a view of the caller's tensor.
+    caller_out = None
+    if unbatched:
+        x = x.unsqueeze(0)
+        if out is not None:
+            caller_out = out
+            out = out.unsqueeze(0)
+
+    if out is None:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0], h_out, w_out),
+            device=x.device,
+            dtype=x.dtype,
+        )
+    result = _launch(x, weight, bias, out, dims)
+    if not unbatched:
+        return result
+    # ATen's ``.out`` overload returns the very object the caller passed, so a
+    # 3-D destination is returned unchanged rather than as a squeezed view of
+    # it; the value path has no caller object and returns the squeezed result.
+    if caller_out is not None:
+        if result.data_ptr() != caller_out.data_ptr():
+            raise RuntimeError("out buffer was not written in place")
+        return caller_out
+    return result.squeeze(0)
+
+
 def slow_conv_dilated2d(
     self,
     weight,
@@ -641,29 +764,28 @@ def slow_conv_dilated2d(
     dilation=None,
     out=None,
 ):
-    """Compute ``slow_conv_dilated2d`` for the FlagGems pytest contract.
-
-    The ATen dispatcher elides trailing arguments equal to the schema defaults
-    (``stride=[1, 1]``, ``padding=[0, 0]``, ``dilation=[1, 1]``), so a Python
-    implementation registered via ``lib.impl`` observes them as ``None`` even
-    when the caller passed them explicitly; the same holds when the caller
-    omits them. ``_as_pair`` rejects ``None``, so apply the documented ATen
-    defaults here, mirroring ``avg_pool2d._parse_pool_params`` upstream.
-    """
+    """Compute ``slow_conv_dilated2d``; see ``_run`` for the argument defaults."""
     logger.debug("GEMS SLOW_CONV_DILATED2D")
-    x = self
-    if stride is None:
-        stride = [1, 1]
-    if padding is None:
-        padding = [0, 0]
-    if dilation is None:
-        dilation = [1, 1]
-    dims = _validate(x, weight, kernel_size, bias, stride, padding, dilation, out)
-    if out is not None:
-        return _launch(x, weight, bias, out, dims)
+    return _run(self, weight, kernel_size, bias, stride, padding, dilation, out)
 
-    _, _, _, _, _, _, _, _, h_out, w_out = dims
-    n = x.shape[0]
-    c_out = weight.shape[0]
-    out = torch.empty((n, c_out, h_out, w_out), device=x.device, dtype=x.dtype)
-    return _launch(x, weight, bias, out, dims)
+
+def slow_conv_dilated2d_out(
+    self,
+    weight,
+    kernel_size,
+    bias=None,
+    stride=None,
+    padding=None,
+    dilation=None,
+    *,
+    out,
+):
+    """``aten::slow_conv_dilated2d.out``: write into ``out`` and return it.
+
+    Without this overload the composite ATen implementation falls back to the
+    value-returning kernel above and copies the result into ``out``, which is
+    an extra full-size device copy.  Registering the overload lets the kernel
+    write the destination directly.
+    """
+    logger.debug("GEMS SLOW_CONV_DILATED2D_OUT")
+    return _run(self, weight, kernel_size, bias, stride, padding, dilation, out)

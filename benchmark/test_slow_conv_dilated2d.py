@@ -28,12 +28,23 @@ from . import base, consts, utils
 # projection (the plain-GEMM path), a dilated atrous kernel (the general
 # implicit-GEMM path), and a strided unpadded kernel. Sizes are kept modest
 # because the ATen baseline is a slow reference convolution.
+#
+# The last two entries exist to time both branches of ``_tap_tile`` on a plane
+# past ``_WIDE_PLANE`` (65536): with H_out = W_out = 254 the plane is
+# 2 * 254 * 254 = 129032.  The first has k_tot = 8 * 3 * 3 = 72, inside
+# ``_WIDE_K_TOT`` (128), so it takes the wide tile; the second has
+# k_tot = 16 * 3 * 3 = 144, past the crossover, so it stays on the narrow tile.
+# Every other entry has a plane well under the threshold (the largest is
+# 4 * 64 * 64 = 16384), so without these two neither branch is ever measured
+# on a wide plane.
 CONV_CASES = [
     (2, 32, 32, 32, 64, 1, 1, 1, 0, 1),
     (2, 32, 32, 32, 64, 3, 3, 2, 1, 1),
     (2, 16, 32, 32, 32, 3, 3, 1, 1, 2),
     (4, 8, 64, 64, 16, 3, 3, 1, 1, 1),
     (8, 4, 28, 28, 8, 3, 3, 2, 1, 2),
+    (2, 8, 256, 256, 32, 3, 3, 1, 1, 1),
+    (2, 16, 256, 256, 32, 3, 3, 1, 1, 1),
 ]
 
 
@@ -42,7 +53,10 @@ class SlowConvDilated2DBenchmark(base.Benchmark):
 
     ``slow_conv_dilated2d`` accepts its geometry as positional
     ``kernel_size`` / ``stride`` / ``padding`` / ``dilation`` pairs, so each
-    case yields a flat argument tuple in that order with an explicit bias.
+    case yields a flat argument tuple in that order.  Every case is measured
+    both with and without a bias: the bias is folded into the accumulator at
+    the end of each kernel, so the ``HAS_BIAS`` branch is a separate path that
+    a bias-only sweep would never exercise without one.
     """
 
     def get_input_iter(self, cur_dtype) -> Generator:
@@ -54,6 +68,7 @@ class SlowConvDilated2DBenchmark(base.Benchmark):
             )
             bias = utils.generate_tensor_input((c_out,), cur_dtype, self.device)
             yield inp, weight, [k_h, k_w], bias, [s, s], [p, p], [d, d]
+            yield inp, weight, [k_h, k_w], None, [s, s], [p, p], [d, d]
 
 
 @pytest.mark.slow_conv_dilated2d
