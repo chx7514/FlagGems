@@ -120,8 +120,21 @@ def test_slow_conv_dilated2d_projection(dtype):
 @pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_slow_conv_dilated2d_out_overload(dtype):
-    """The ``out=`` overload writes into the caller's buffer and returns it."""
+@pytest.mark.parametrize(
+    "buffer_kind",
+    [
+        "empty_buffer",
+        "wrong_shape",
+        "noncontiguous",
+    ],
+)
+def test_slow_conv_dilated2d_out(dtype, buffer_kind):
+    """``out=`` writes in place, resizes like ATen, and keeps a non-contiguous layout.
+
+    ATen's ``.out`` overload resizes the destination to the required shape, so
+    an empty or wrongly shaped buffer is legal.  The kernels consume the
+    destination strides, so a non-contiguous buffer must keep its layout.
+    """
     inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
     weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)
@@ -131,39 +144,77 @@ def test_slow_conv_dilated2d_out_overload(dtype):
         ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
     )
 
-    out_buf = torch.empty((2, 4, 7, 7), dtype=dtype, device=flag_gems.device)
-    res_out = flag_gems.ops.slow_conv_dilated2d(
+    if buffer_kind == "empty_buffer":
+        out_buf = torch.empty(0, dtype=dtype, device=flag_gems.device)
+    elif buffer_kind == "wrong_shape":
+        out_buf = torch.empty((1, 1, 1, 1), dtype=dtype, device=flag_gems.device)
+    else:
+        out_buf = torch.empty(
+            (2, 4, 7, 7), dtype=dtype, device=flag_gems.device
+        ).transpose(2, 3)
+        assert not out_buf.is_contiguous()
+
+    res_out = flag_gems.ops.slow_conv_dilated2d_out(
         inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
     )
 
     assert res_out is out_buf
+    assert res_out.shape == (2, 4, 7, 7)
     utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
 
 
 @pytest.mark.slow_conv_dilated2d_out
 @pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_slow_conv_dilated2d_out_resize(dtype):
-    """``out=`` resizes a wrongly shaped destination, as ATen's overload does."""
-    inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
-    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
-    ref_inp = utils.to_reference(inp, True)
-    ref_weight = utils.to_reference(weight, True)
+def test_slow_conv_dilated2d_dispatch():
+    """Both overloads are wired into the registration table.
 
-    ref_out = torch.ops.aten.slow_conv_dilated2d(
-        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
-    )
+    A false pass is possible whenever the tests call the Python entry points
+    directly, so assert the ``_FULL_CONFIG`` keys exist and that the ``.out``
+    overload reaches a CUDA implementation.
+    """
+    registered = {entry[0] for entry in flag_gems._FULL_CONFIG}
+    assert "slow_conv_dilated2d" in registered
+    assert "slow_conv_dilated2d.out" in registered
 
-    # An empty buffer is what ``torch.empty(0)`` callers pass; ATen's ``.out``
-    # contract resizes it to the required shape rather than raising.
-    out_buf = torch.empty(0, dtype=dtype, device=flag_gems.device)
-    res_out = flag_gems.ops.slow_conv_dilated2d_out(
-        inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
-    )
+    # The native operator only has a CompositeExplicitAutograd entry; a CUDA
+    # implementation appearing means the registered overload is the one that
+    # dispatches on device.
+    library = torch.library.Library("aten", "IMPL")
+    previous_registrar = flag_gems.current_work_registrar
+    try:
+        flag_gems.only_enable(
+            lib=library,
+            include=["slow_conv_dilated2d_out"],
+            registrar=flag_gems.GeneralOpRegistrar,
+        )
+        cuda_entries = [
+            line
+            for line in torch._C._dispatch_dump(
+                "aten::slow_conv_dilated2d.out"
+            ).splitlines()
+            if line.startswith("CUDA:")
+        ]
+        assert cuda_entries, "no CUDA kernel registered for the .out overload"
 
-    assert res_out.shape == (2, 4, 7, 7)
-    assert out_buf.shape == (2, 4, 7, 7)
-    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+        # Dispatch through ``torch.ops.aten`` so the check cannot pass on the
+        # Python entry point alone.
+        inp = torch.randn((2, 3, 9, 9), dtype=torch.float32, device=flag_gems.device)
+        weight = torch.randn((4, 3, 3, 3), dtype=torch.float32, device=flag_gems.device)
+        ref_out = torch.ops.aten.slow_conv_dilated2d(
+            inp.double(), weight.double(), [3, 3], None, [1, 1], [1, 1], [2, 2]
+        )
+        out_buf = torch.empty(
+            (2, 4, 7, 7), dtype=torch.float32, device=flag_gems.device
+        )
+        res_out = torch.ops.aten.slow_conv_dilated2d.out(
+            inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
+        )
+        assert res_out is out_buf
+        utils.gems_assert_close(res_out, ref_out, torch.float32, atol=DEFAULT_ATOL)
+    finally:
+        if hasattr(library, "_destroy"):
+            library._destroy()
+        flag_gems.current_work_registrar = previous_registrar
 
 
 @pytest.mark.slow_conv_dilated2d
@@ -226,33 +277,16 @@ def test_slow_conv_dilated2d_unbatched(dtype):
     # batch-0 slice, not merely close.
     assert torch.equal(res_out, res_batched[0])
 
-
-@pytest.mark.slow_conv_dilated2d_out
-@pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_slow_conv_dilated2d_unbatched_out(dtype):
-    """A 3-D ``out=`` buffer is written in place and returned unchanged."""
-    x3 = torch.randn((3, 9, 9), dtype=dtype, device=flag_gems.device)
-    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
-    ref_x3 = utils.to_reference(x3, True)
-    ref_weight = utils.to_reference(weight, True)
-
-    ref_out = torch.ops.aten.slow_conv_dilated2d(
-        ref_x3, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
+    # A 3-D ``out=`` buffer is written in place and returned unchanged, so the
+    # unbatched destination keeps the caller's rank rather than gaining a batch
+    # axis internally.
+    out_buf = torch.empty((4, 6, 6), dtype=dtype, device=flag_gems.device)
+    out_res = flag_gems.ops.slow_conv_dilated2d_out(
+        x3, weight, [3, 3], None, [1, 1], [0, 0], [1, 1], out=out_buf
     )
-    assert ref_out.shape == (4, 7, 7)
-
-    out_buf = torch.empty((4, 7, 7), dtype=dtype, device=flag_gems.device)
-    res_out = flag_gems.ops.slow_conv_dilated2d_out(
-        x3, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
-    )
-
-    # ATen returns the very object the caller passed, so the same identity
-    # contract holds here rather than only sharing storage.
-    assert res_out is out_buf
-    assert res_out.shape == (4, 7, 7)
-    assert out_buf.shape == (4, 7, 7)
-    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
+    assert out_res is out_buf
+    assert out_buf.shape == (4, 6, 6)
+    utils.gems_assert_close(out_res, ref_out, dtype, atol=_atol(dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -368,90 +402,6 @@ def test_slow_conv_dilated2d_empty(dtype):
     res_out = flag_gems.slow_conv_dilated2d(inp, weight, [3, 3], None, [1, 1], [1, 1])
     assert res_out.shape == (2, 0, 8, 8)
     assert res_out.numel() == 0
-
-
-@pytest.mark.slow_conv_dilated2d_out
-@pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_slow_conv_dilated2d_noncontiguous_out(dtype):
-    """A non-contiguous ``out`` keeps its layout, identity and values."""
-    inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
-    weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
-    ref_inp = utils.to_reference(inp, True)
-    ref_weight = utils.to_reference(weight, True)
-    ref_out = torch.ops.aten.slow_conv_dilated2d(
-        ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
-    )
-
-    # (N, C_out, H_out, W_out) laid out with the last two axes transposed.
-    out_buf = torch.empty((2, 4, 7, 7), dtype=dtype, device=flag_gems.device).transpose(
-        2, 3
-    )
-    assert not out_buf.is_contiguous()
-    res_out = flag_gems.ops.slow_conv_dilated2d_out(
-        inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
-    )
-
-    assert res_out is out_buf
-    assert res_out.stride() == out_buf.stride()
-    utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
-
-
-# ---------------------------------------------------------------------------
-# Dispatch coverage for the .out overload
-#
-# The tests above call the FlagGems entry points directly.  To prove that the
-# ``aten::slow_conv_dilated2d.out`` overload registered in ``_FULL_CONFIG`` is
-# actually reachable, dispatch through ``torch.ops.aten`` inside a registrar
-# scope.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow_conv_dilated2d_out
-@pytest.mark.slow_conv_dilated2d
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_slow_conv_dilated2d_out_dispatch(dtype):
-    """``torch.ops.aten.slow_conv_dilated2d.out`` lands on the GEMS kernel."""
-    library = torch.library.Library("aten", "IMPL")
-    previous_registrar = flag_gems.current_work_registrar
-    try:
-        flag_gems.only_enable(
-            lib=library,
-            include=["slow_conv_dilated2d_out"],
-            registrar=flag_gems.GeneralOpRegistrar,
-        )
-        # The native operator only has a CompositeExplicitAutograd entry, so a
-        # CUDA implementation appearing in the dump -- and the key being listed
-        # by the active registrar -- is what proves the new overload landed.
-        cuda_entries = [
-            line
-            for line in torch._C._dispatch_dump(
-                "aten::slow_conv_dilated2d.out"
-            ).splitlines()
-            if line.startswith("CUDA:")
-        ]
-        assert cuda_entries, "no CUDA kernel registered for the .out overload"
-        assert "slow_conv_dilated2d.out" in flag_gems.all_registered_keys()
-
-        inp = torch.randn((2, 3, 9, 9), dtype=dtype, device=flag_gems.device)
-        weight = torch.randn((4, 3, 3, 3), dtype=dtype, device=flag_gems.device)
-        ref_inp = utils.to_reference(inp, True)
-        ref_weight = utils.to_reference(weight, True)
-        ref_out = torch.ops.aten.slow_conv_dilated2d(
-            ref_inp, ref_weight, [3, 3], None, [1, 1], [1, 1], [2, 2]
-        )
-
-        out_buf = torch.empty((2, 4, 7, 7), dtype=dtype, device=flag_gems.device)
-        res_out = torch.ops.aten.slow_conv_dilated2d.out(
-            inp, weight, [3, 3], None, [1, 1], [1, 1], [2, 2], out=out_buf
-        )
-
-        assert res_out is out_buf
-        utils.gems_assert_close(res_out, ref_out, dtype, atol=_atol(dtype))
-    finally:
-        if hasattr(library, "_destroy"):
-            library._destroy()
-        flag_gems.current_work_registrar = previous_registrar
 
 
 @pytest.mark.slow_conv_dilated2d

@@ -81,3 +81,51 @@ def test_slow_conv_dilated2d(dtype):
         dtypes=[dtype],
     )
     bench.run()
+
+
+class SlowConvDilated2DOutBenchmark(base.Benchmark):
+    """Benchmark for ``aten::slow_conv_dilated2d.out``.
+
+    The ``.out`` overload is a separate registered entry, so it needs its own
+    benchmark instance -- the base class dispatches to whatever callable is
+    passed as ``torch_op`` and never switches overloads on its own.  The
+    destination buffer is reused across iterations, which is the reason the
+    overload exists: without it the composite implementation allocates a result
+    and copies it into ``out``.
+
+    Each case is measured without a bias only.  A bias makes the ATen
+    reference take a path that is 18-24x slower than its own no-bias path (see
+    the accuracy test module), so a bias comparison would measure that
+    discrepancy instead of the kernel.
+    """
+
+    def get_input_iter(self, cur_dtype) -> Generator:
+        for case in CONV_CASES:
+            n, c_in, h, w, c_out, k_h, k_w, s, p, d = case
+            inp = utils.generate_tensor_input((n, c_in, h, w), cur_dtype, self.device)
+            weight = utils.generate_tensor_input(
+                (c_out, c_in, k_h, k_w), cur_dtype, self.device
+            )
+            out = self._output_buffer(inp, weight, k_h, k_w, s, p, d, cur_dtype)
+            yield inp, weight, [k_h, k_w], None, [s, s], [p, p], [d, d], {"out": out}
+
+    def _output_buffer(self, inp, weight, k_h, k_w, s, p, d, cur_dtype):
+        n, _, h, w = inp.shape
+        c_out = weight.shape[0]
+        h_out = (h + 2 * p - d * (k_h - 1) - 1) // s + 1
+        w_out = (w + 2 * p - d * (k_w - 1) - 1) // s + 1
+        return torch.empty(
+            (n, c_out, h_out, w_out), dtype=cur_dtype, device=self.device
+        )
+
+
+@pytest.mark.slow_conv_dilated2d_out
+@pytest.mark.parametrize("dtype", consts.FLOAT_DTYPES)
+def test_slow_conv_dilated2d_out(dtype):
+    bench = SlowConvDilated2DOutBenchmark(
+        op_name="slow_conv_dilated2d_out",
+        torch_op=torch.ops.aten.slow_conv_dilated2d.out,
+        gems_op=flag_gems.ops.slow_conv_dilated2d_out,
+        dtypes=[dtype],
+    )
+    bench.run()
