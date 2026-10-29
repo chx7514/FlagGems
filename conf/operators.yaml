@@ -4412,6 +4412,7 @@ tensor into the caller-supplied `out` buffer.
     returning the gradient as a plain tensor.
   for:
     - _cudnn_ctc_loss
+    - _cudnn_ctc_loss.Tensor
   labels:
     - aten
     - KernelGen
