@@ -21,6 +21,8 @@ element values, and cover negative axes, non-contiguous operands, scalar/empty
 tensors, autograd and the ATen error messages.
 """
 
+import logging
+
 import pytest
 import torch
 
@@ -267,3 +269,37 @@ def test_swapaxes_invalid_axes(shape, axis0, axis1):
     with pytest.raises(IndexError) as res_exc_info:
         flag_gems.swapaxes(inp, axis0, axis1)
     assert str(res_exc_info.value) == str(ref_exc_info.value)
+
+
+@pytest.mark.swapaxes
+def test_swapaxes_dispatch_reaches_gems_impl(caplog):
+    """``aten::swapaxes`` must actually run the FlagGems implementation.
+
+    ``aten::swapaxes`` is registered as CompositeImplicitAutograd, unlike
+    ``aten::transpose.int`` (CompositeExplicitAutograd), so it is not obvious
+    that the plain device-key registration in ``_FULL_CONFIG`` intercepts it
+    rather than letting the native decomposition run. Every other test in this
+    file calls ``flag_gems.swapaxes`` directly and therefore passes whether or
+    not registration works, so the dispatch path is verified here: register via
+    the same registrar ``use_gems()`` uses and assert the impl's own log line
+    fires for a ``torch.swapaxes`` call.
+    """
+    inp = torch.randn((3, 4, 5), dtype=torch.float32, device=flag_gems.device)
+    lib = torch.library.Library("aten", "IMPL")
+
+    caplog.set_level(logging.DEBUG, logger="flag_gems.ops.swapaxes")
+    try:
+        flag_gems.only_enable(lib=lib, include=["swapaxes"])
+        assert "swapaxes" in flag_gems.all_registered_keys()
+
+        res_out = torch.swapaxes(inp, 0, 2)
+
+        assert "GEMS SWAPAXES" in caplog.text
+    finally:
+        lib._destroy()
+
+    # The registered kernel is the FlagGems view, not a copy.
+    ref_out = torch.swapaxes(inp, 0, 2)
+    assert tuple(res_out.shape) == (5, 4, 3)
+    assert res_out.stride() == ref_out.stride()
+    assert res_out.data_ptr() == inp.data_ptr()

@@ -15,8 +15,6 @@
 import pytest
 import torch
 
-import flag_gems
-
 from . import base, consts
 
 # 2D / 3D / 4D shapes for benchmarking swapaxes. swapaxes is a zero-copy view
@@ -51,10 +49,13 @@ class SwapaxesBenchmark(base.Benchmark):
 
 @pytest.mark.swapaxes
 def test_swapaxes():
+    # Only ``torch_op`` is passed: ``benchmark/base.py`` then wraps the
+    # candidate call in ``flag_gems.use_gems()``, so the measured latency is
+    # the registered dispatch path. Passing ``gems_op`` would swap in
+    # ``nullcontext()`` and time a direct function call that no user hits.
     bench = SwapaxesBenchmark(
         op_name="swapaxes",
         torch_op=torch.swapaxes,
-        gems_op=flag_gems.swapaxes,
         dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
