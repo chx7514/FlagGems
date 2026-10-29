@@ -341,6 +341,24 @@ def _lengths_to_tensor(values, device):
     return torch.tensor(list(values), dtype=torch.long, device=device)
 
 
+def _stage_to_device(host, device):
+    """Upload one host-side `long` vector asynchronously.
+
+    The lengths and targets arrive on the host, but every kernel needs them on
+    the device. A *blocking* H2D copy of a few hundred bytes costs ~2ms of host
+    time on the CUDA backend and two of them per call dwarf the kernels.
+
+    The non-blocking variant of a regular pageable copy costs microseconds, and
+    it is markedly cheaper than the pinned one here: a pinned staging buffer
+    followed immediately by a kernel serializes into a ~2ms stall, while the
+    pageable async path runs at ~8us. The copy is ordered on the caller's
+    stream, so the kernels below still see the data.
+    """
+    out = torch.empty(host.numel(), dtype=torch.long, device=device)
+    out.copy_(host, non_blocking=True)
+    return out
+
+
 def _target_offsets(target_lengths, device, batch_size):
     """Exclusive prefix sum of `target_lengths`.
 
@@ -474,11 +492,9 @@ class CudnnCtcLossFunction(torch.autograd.Function):
         T, batch_size, num_classes = log_probs.shape
         work_log_probs = log_probs.contiguous()
         # cuDNN requires the targets to live on the CPU, but the Triton kernels
-        # run on the device, so the tensor is staged there.
-        work_targets = targets.to(device=log_probs.device, dtype=torch.int32)
-        work_targets = work_targets.contiguous()
-        # The two length vectors (and the target offsets for a concatenated
-        # target tensor) travel to the device in a single copy.
+        # run on the device. Targets and lengths are packed into a single host
+        # vector and uploaded in one go: separate small blocking copies cost
+        # milliseconds apiece on the CUDA backend.
         if not torch.is_tensor(input_lengths) and not torch.is_tensor(target_lengths):
             input_lengths = list(input_lengths)
             target_lengths = list(target_lengths)
@@ -492,15 +508,23 @@ class CudnnCtcLossFunction(torch.autograd.Function):
             for index, length in enumerate(target_lengths):
                 offsets[index] = running
                 running += int(length)
-            host = torch.tensor(
+            lengths_host = torch.tensor(
                 input_lengths + target_lengths + offsets,
                 dtype=torch.long,
-                device=log_probs.device,
             )
-            work_input_lengths = host[:batch_size]
-            work_target_lengths = host[batch_size : 2 * batch_size]
-            target_offsets = host[2 * batch_size :]
+            target_count = targets.numel()
+            packed = torch.empty(target_count + lengths_host.numel(), dtype=torch.long)
+            packed[:target_count].copy_(targets.to(torch.long))
+            packed[target_count:].copy_(lengths_host)
+            staged = _stage_to_device(packed, log_probs.device)
+            work_targets = staged[:target_count].to(torch.int32)
+            lengths = staged[target_count:]
+            work_input_lengths = lengths[:batch_size]
+            work_target_lengths = lengths[batch_size : 2 * batch_size]
+            target_offsets = lengths[2 * batch_size :]
         else:
+            work_targets = targets.to(device=log_probs.device, dtype=torch.int32)
+            work_targets = work_targets.contiguous()
             work_input_lengths = _lengths_to_tensor(input_lengths, log_probs.device)
             work_target_lengths = _lengths_to_tensor(target_lengths, log_probs.device)
             target_offsets = _target_offsets(
