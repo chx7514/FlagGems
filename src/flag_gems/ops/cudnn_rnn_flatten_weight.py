@@ -56,15 +56,41 @@ _DESC_CACHE_SIZE = 8
 # alive; a plain dict with a bounded size does the same job.
 _DESC_CACHE = {}
 
+# Bounded, grow-on-demand host staging buffer for descriptor uploads. A pageable
+# host->device copy of even a few hundred bytes costs milliseconds on some
+# drivers, while the same copy from pinned memory is a few microseconds, so
+# every cache miss goes through this buffer.
+_PINNED_STAGING = None
+
+
+def _pinned_staging(numel):
+    global _PINNED_STAGING
+    buf = _PINNED_STAGING
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=torch.int64, pin_memory=True)
+        _PINNED_STAGING = buf
+    return buf[:numel]
+
+
+def _upload_descriptor(flat_rows, device):
+    """Upload ``flat_rows`` (a flat int64 sequence) through pinned staging."""
+    host = _pinned_staging(len(flat_rows))
+    host.copy_(torch.tensor(flat_rows, dtype=torch.int64))
+    return host.to(device, non_blocking=True)
+
 
 def _descriptor_for(rows, device):
     """Return a device int64 ``[n, 3]`` copy of ``rows``, reusing cached ones."""
-    key = tuple(rows)
+    # The key must include the device: data_ptr values are per-process virtual
+    # addresses and can repeat across devices, so a rows-only key would hand
+    # back a descriptor living on another GPU.
+    key = (device, tuple(rows))
     desc = _DESC_CACHE.get(key)
     if desc is None:
+        flat_rows = [v for row in rows for v in row]
+        desc = _upload_descriptor(flat_rows, device).reshape(-1, 3)
         if len(_DESC_CACHE) >= _DESC_CACHE_SIZE:
             _DESC_CACHE.clear()
-        desc = torch.tensor(rows, dtype=torch.int64, device=device).reshape(-1, 3)
         _DESC_CACHE[key] = desc
     return desc
 
@@ -100,6 +126,27 @@ def _flatten_weight_kernel(
     # reserves room for biases), so it is masked out and never dereferenced.
     val = tl.load(src + offs, mask=mask & (src_addr >= 0), other=0)
     tl.store(out + dst_off + offs, val, mask=mask)
+
+
+@triton.jit
+def _linear_copy_kernel(
+    src_ptr,
+    out_ptr,
+    n_elements,
+    ELEM_DTYPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Copy ``n_elements`` elements from ``src_ptr`` to ``out_ptr``.
+
+    Used by the ``.out`` overload, which — like the reference — must hand the
+    caller a copy while the weights keep viewing a separate buffer.
+    """
+    pid = tl.program_id(0)
+    out = out_ptr.to(tl.pointer_type(ELEM_DTYPE))
+    src = src_ptr.to(tl.pointer_type(ELEM_DTYPE))
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    tl.store(out + offs, tl.load(src + offs, mask=mask), mask=mask)
 
 
 def _build_copy_plan(
@@ -187,6 +234,89 @@ def _build_copy_plan(
     return runs, offset
 
 
+def _canonical_base(weight_arr, runs, total):
+    """Return the storage the weights already share, or None.
+
+    ``nn.RNNBase.flatten_parameters()`` runs on every ``forward()``, so after
+    the first flatten the weights are contiguous views into one flat buffer,
+    each sitting exactly at the offset the copy plan assigns it. In that state
+    the flat buffer *is* the input storage, so there is nothing to copy and
+    nothing to rebind: the returned storage can be handed back directly. This
+    is checked on the host with a handful of attribute reads per weight.
+    """
+    base = None
+    next_dst = 0
+    for src, dst, size in runs:
+        if size == 0:
+            continue
+        # The runs must tile the whole buffer in plan order; otherwise the
+        # input storage is not the flat buffer.
+        if dst != next_dst:
+            return None
+        next_dst += size
+        if src < 0:
+            # A reserved bias slot. It must stay zero in the flat buffer, and in
+            # a buffer produced by this operator it already is.
+            continue
+        w = weight_arr[src]
+        storage = w.untyped_storage()
+        if base is None:
+            base = storage
+        elif storage.data_ptr() != base.data_ptr():
+            return None
+        # An untyped-storage offset is measured in elements, the same unit as
+        # the plan's ``dst``, so this is an exact host-side check.
+        if w.storage_offset() != dst or w.numel() != size or not w.is_contiguous():
+            return None
+    if base is None or next_dst != total:
+        return None
+    return base
+
+
+def _rebind_weights(weight_arr, runs, out, total):
+    """Point every weight at its slot inside the flat ``out`` buffer.
+
+    This mirrors the reference operator's ``set_orig_weights_to_flat_buf`` step
+    (PyTorch ``cudnn/RNN.cpp``): after the call each ``weight_arr[i]`` is a view
+    into the flat buffer instead of its original storage. ``set_`` keeps shape,
+    dtype and ``requires_grad`` while swapping storage, so parameters stay
+    usable as parameters.
+    """
+    if total == 0:
+        return
+    out_storage = out.untyped_storage()
+    # ``set_`` on a leaf that requires grad is an in-place op, so it must run
+    # under no_grad; ``nn.RNNBase.flatten_parameters`` does the same around its
+    # call into the reference operator.
+    with torch.no_grad():
+        for src, dst, size in runs:
+            if src < 0 or size == 0:
+                continue
+            w = weight_arr[src]
+            if w.is_contiguous():
+                # The slot is contiguous by construction, so the weight's own
+                # strides describe it exactly; set_ swaps storage without
+                # rebuilding the view.
+                w.set_(out_storage, dst, w.shape, w.stride())
+            else:
+                # Same layout as the reference's ``view_as``: reshape the flat
+                # slot so a non-contiguous weight keeps its logical element
+                # order.
+                w.set_(out.narrow(0, dst, size).reshape(w.shape))
+
+
+def _copy_plan_descriptor(runs, flat_weights, device):
+    """Build/lookup the device descriptor for ``runs`` (see the kernel doc)."""
+    rows = [
+        (flat_weights[src].data_ptr() if src >= 0 else -1, dst, size)
+        for src, dst, size in runs
+        if size > 0
+    ]
+    desc = _descriptor_for(rows, device)
+    max_count = max(size for _, _, size in rows)
+    return desc, len(rows), max_count
+
+
 def _flatten_weight_impl(
     weight_arr,
     weight_stride0,
@@ -217,43 +347,78 @@ def _flatten_weight_impl(
     )
 
     # Keep the (possibly reshaped) views alive until the kernel has consumed
-    # them.
-    flat_weights = [w.reshape(-1) for w in weight_arr]
+    # them. Built lazily: the canonical fast path below never needs them, and
+    # the steady state of ``flatten_parameters()`` takes that path.
+    flat_weights = None
 
-    elem_size = flat_weights[0].element_size()
+    elem_size = weight_arr[0].element_size()
     if elem_size not in _ELEM_TO_TL_DTYPE:
         raise RuntimeError(
             f"cudnn_rnn_flatten_weight: unsupported weight element size {elem_size}"
         )
     elem_dtype = _ELEM_TO_TL_DTYPE[elem_size]
 
-    if out is None:
-        out = torch.empty(total, dtype=weight_arr[0].dtype, device=weight_arr[0].device)
-    else:
-        if out.dtype != weight_arr[0].dtype:
+    # The flat buffer is a pure copy, so all weights must share one dtype:
+    # rebinding below views the buffer with the buffer's dtype, and the
+    # reference implementation rejects mixed dtypes too ("parameter types
+    # mismatch").
+    dtype = weight_arr[0].dtype
+    device = weight_arr[0].device
+    for w in weight_arr:
+        if w.dtype != dtype:
             raise RuntimeError(
-                "cudnn_rnn_flatten_weight.out: expected out tensor to have "
-                f"dtype {weight_arr[0].dtype}, but got {out.dtype}"
+                "cudnn_rnn_flatten_weight: all weights must have the same dtype, "
+                f"got {dtype} and {w.dtype}"
             )
-        out.resize_(total)
 
-    if total > 0:
-        rows = [
-            (flat_weights[src].data_ptr() if src >= 0 else -1, dst, size)
-            for src, dst, size in runs
-            if size > 0
-        ]
-        desc = _descriptor_for(rows, weight_arr[0].device)
-        num_segs = len(rows)
-        max_count = max(size for _, _, size in runs)
-        grid = (num_segs, triton.cdiv(max_count, BLOCK_SIZE))
-        _flatten_weight_kernel[grid](
-            desc,
-            out,
-            ELEM_DTYPE=elem_dtype,
-            BLOCK=BLOCK_SIZE,
+    canonical = _canonical_base(weight_arr, runs, total) if total > 0 else None
+    if canonical is not None:
+        # The weights already view one flat buffer in plan order, so the flat
+        # result *is* the input storage: nothing to copy and nothing to rebind.
+        # This is the steady state of ``flatten_parameters()``, which runs on
+        # every forward, so it has to stay free of device work.
+        flat = torch.empty(0, dtype=dtype, device=device).set_(canonical, 0, (total,))
+        if out is None:
+            return flat
+        out.resize_(total)
+        out.copy_(flat)
+        return out
+
+    if out is not None and out.dtype != dtype:
+        raise RuntimeError(
+            "cudnn_rnn_flatten_weight.out: expected out tensor to have "
+            f"dtype {dtype}, but got {out.dtype}"
         )
 
+    # The reference ``.out`` overload fills ``out`` from a buffer that the
+    # weights are rebound onto, so the weights alias an internal buffer rather
+    # than the caller's tensor. Keep that separation: filling ``out`` in place
+    # and rebinding onto it would make every weight alias the caller's tensor.
+    buffer = torch.empty(total, dtype=dtype, device=device)
+    if total > 0:
+        flat_weights = [w.reshape(-1) for w in weight_arr]
+        desc, num_segs, max_count = _copy_plan_descriptor(runs, flat_weights, device)
+        grid = (num_segs, triton.cdiv(max_count, BLOCK_SIZE))
+        # Triton launches on the *current* device, so kernels for tensors on
+        # another GPU need that device made current first. The reference does
+        # the same in `flatten_parameters()` via `torch.cuda.device_of`.
+        with torch.cuda.device(device):
+            _flatten_weight_kernel[grid](
+                desc,
+                buffer,
+                ELEM_DTYPE=elem_dtype,
+                BLOCK=BLOCK_SIZE,
+            )
+
+    # Rebind every weight onto the flat buffer, which is the whole point of the
+    # operator: the only production caller (``nn.RNNBase.flatten_parameters``)
+    # throws the return value away and relies on this side effect.
+    _rebind_weights(weight_arr, runs, buffer, total)
+
+    if out is None:
+        return buffer
+    out.resize_(total)
+    out.copy_(buffer)
     return out
 
 
