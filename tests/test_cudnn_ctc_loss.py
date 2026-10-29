@@ -246,7 +246,10 @@ def test_cudnn_ctc_loss_weighted_grad():
     log_probs = torch.log_softmax(raw, dim=-1)
     targets = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
     target_lengths = [2, 1, 1]
-    weights = torch.tensor([1.0, 0.0, -2.0], dtype=torch.float32, device=device)
+    # One weight vector per side: under --ref=cpu the reference works on the
+    # host while the operator stays on the device, and the upstream gradient has
+    # to sit next to the loss it scales.
+    upstream = [1.0, 0.0, -2.0]
 
     ref_lp = utils.to_reference(log_probs, True).clone().requires_grad_(True)
     ref = F.ctc_loss(
@@ -257,13 +260,15 @@ def test_cudnn_ctc_loss_weighted_grad():
         reduction="none",
         zero_infinity=False,
     )
-    (ref_grad,) = torch.autograd.grad((ref * weights).sum(), ref_lp)
+    ref_weights = torch.tensor(upstream, dtype=ref_lp.dtype, device=ref_lp.device)
+    (ref_grad,) = torch.autograd.grad((ref * ref_weights).sum(), ref_lp)
 
     gems_lp = log_probs.clone().requires_grad_(True)
     out = flag_gems.cudnn_ctc_loss(
         gems_lp, targets, [t_steps] * batch, target_lengths, 0, False, False
     )
-    (gems_grad,) = torch.autograd.grad((out[0] * weights).sum(), gems_lp)
+    gems_weights = torch.tensor(upstream, dtype=log_probs.dtype, device=device)
+    (gems_grad,) = torch.autograd.grad((out[0] * gems_weights).sum(), gems_lp)
 
     utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
 
