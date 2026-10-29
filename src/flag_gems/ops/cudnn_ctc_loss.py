@@ -257,7 +257,7 @@ def cudnn_ctc_loss_backward_kernel(
     target_value2 = tl.load(target_ptrs2, mask=target_mask2, other=BLANK)
     labels2 = target_value2
 
-    scale = tl.load(grad_output).to(tl.float32)
+    scale = tl.load(grad_output + batch).to(tl.float32)
 
     beta_init = tl.where(
         ((states == state_count - 1) | ((states == state_count - 2) & (target_len > 0)))

@@ -231,6 +231,44 @@ def test_cudnn_ctc_loss_autograd():
 
 
 @pytest.mark.cudnn_ctc_loss
+def test_cudnn_ctc_loss_weighted_grad():
+    """Each batch entry must be scaled by its own upstream gradient.
+
+    A plain `.sum()` upstream folds into a uniform gradient, which hides a
+    per-batch indexing bug in the backward kernel: every sample would be
+    scaled by `grad_output[0]` and still match. Weighting the upstream by a
+    per-batch vector makes the scaling observable.
+    """
+    device = flag_gems.device
+    torch.manual_seed(0)
+    t_steps, batch, classes = 16, 3, 8
+    raw = torch.randn(t_steps, batch, classes, dtype=torch.float32, device=device)
+    log_probs = torch.log_softmax(raw, dim=-1)
+    targets = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    target_lengths = [2, 1, 1]
+    weights = torch.tensor([1.0, 0.0, -2.0], dtype=torch.float32, device=device)
+
+    ref_lp = utils.to_reference(log_probs, True).clone().requires_grad_(True)
+    ref = F.ctc_loss(
+        ref_lp,
+        targets.to(ref_lp.device),
+        [t_steps] * batch,
+        target_lengths,
+        reduction="none",
+        zero_infinity=False,
+    )
+    (ref_grad,) = torch.autograd.grad((ref * weights).sum(), ref_lp)
+
+    gems_lp = log_probs.clone().requires_grad_(True)
+    out = flag_gems.cudnn_ctc_loss(
+        gems_lp, targets, [t_steps] * batch, target_lengths, 0, False, False
+    )
+    (gems_grad,) = torch.autograd.grad((out[0] * weights).sum(), gems_lp)
+
+    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
+
+
+@pytest.mark.cudnn_ctc_loss
 def test_cudnn_ctc_loss_tensor_lengths():
     """`input_lengths`/`target_lengths` may be passed as tensors."""
     device = flag_gems.device
