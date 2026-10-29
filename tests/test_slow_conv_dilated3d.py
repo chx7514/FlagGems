@@ -201,11 +201,14 @@ def test_slow_conv_dilated3d_empty_channels(dtype, bias):
     )
     assert tuple(res_out.shape) == (2, 3, 2, 2, 2)
 
-    expected = (
-        bias_t.to(torch.float64).view(1, 3, 1, 1, 1).expand(res_out.shape)
-        if bias
-        else torch.zeros_like(res_out, dtype=torch.float64)
-    )
+    # Build the expectation through to_reference so it lands on the same device
+    # the harness expects for a reference tensor (CPU under --ref cpu).
+    if bias:
+        expected = utils.to_reference(
+            bias_t.reshape(1, 3, 1, 1, 1).expand(res_out.shape), True
+        )
+    else:
+        expected = utils.to_reference(torch.zeros_like(res_out), True)
     utils.gems_assert_close(
         res_out,
         expected.to(dtype),
