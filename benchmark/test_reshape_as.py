@@ -23,19 +23,23 @@ from . import base, consts
 
 
 def _reshape_as_input_fn(shape, dtype, device):
-    # Non-contiguous source: a transposed layout (2D+) or a stride-2 slice
-    # (1D) whose flat target cannot be a view, so the benchmark measures the
-    # materializing copy kernel instead of only dispatch overhead on the
-    # contiguous view path.
+    # Both branches are benchmarked, because neither one dominates: a
+    # stride-2 1-D slice and a transposed N-D source differ only in layout.
+    # A 1-D source of any stride is always stride-expressible as any shape
+    # with the same numel, so it measures the zero-copy view/dispatch path. A
+    # transposed N-D source only stays a view when the target keeps the same
+    # trailing size; flattening it needs the materializing copy kernel.
     numel = 1
     for s in shape:
         numel *= s
-    if len(shape) >= 2:
-        inp = torch.randn(shape, dtype=dtype, device=device).transpose(0, -1)
-    else:
-        inp = torch.randn((2 * numel,), dtype=dtype, device=device)[::2]
     other = torch.randn((numel,), dtype=dtype, device=device)
-    yield inp, other
+    if len(shape) >= 2:
+        yield torch.randn(shape, dtype=dtype, device=device).transpose(0, -1), other
+    else:
+        # Same target as the N-D cases: a flat 1-D source, so the 1-D rows
+        # report the view path rather than a copy that a real reshape could
+        # never need here.
+        yield torch.randn(shape, dtype=dtype, device=device), other
 
 
 @pytest.mark.reshape_as

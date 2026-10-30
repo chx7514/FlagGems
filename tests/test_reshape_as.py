@@ -68,6 +68,18 @@ else:
         ((12, 24), "both_steps", (2, 12)),
     ]
 
+# Complex sources never reach the copy branch through a view: a contiguous
+# complex tensor views to any same-numel shape, and only an unresolvable
+# layout materializes. These layouts exercise the lazy conj/neg re-application
+# in ``_copy_logical``; ``conj_physical_``/``neg_`` must reproduce the logical
+# values of the source, not the raw storage.
+RESHAPE_AS_COMPLEX_COPY_CASES = [
+    ((4, 6), "transposed", (24,)),
+    ((4, 6), "transposed_conj", (24,)),
+    ((4, 6), "transposed_neg", (24,)),
+    ((4, 6), "transposed_conj_neg", (24,)),
+]
+
 
 def _apply_layout(base, transform, expand_shape=None):
     if transform == "asis":
@@ -84,6 +96,12 @@ def _apply_layout(base, transform, expand_shape=None):
         return base.expand(tuple(expand_shape))
     if transform == "empty_t":
         return base.t()
+    if transform == "transposed_conj":
+        return base.conj().transpose(-1, -2)
+    if transform == "transposed_neg":
+        return base._neg_view().transpose(-1, -2)
+    if transform == "transposed_conj_neg":
+        return base.conj()._neg_view().transpose(-1, -2)
     raise ValueError("unsupported layout " + repr(transform))
 
 
@@ -242,3 +260,22 @@ def test_reshape_as_other_has_no_gradient(dtype):
         res_out, other, grad_outputs=torch.ones_like(res_out), allow_unused=True
     )[0]
     assert res_other_grad is None
+
+
+@pytest.mark.reshape_as
+@pytest.mark.parametrize("shape,layout,target", RESHAPE_AS_COMPLEX_COPY_CASES)
+@pytest.mark.parametrize("dtype", utils.COMPLEX_DTYPES)
+def test_reshape_as_complex_copy(shape, layout, target, dtype):
+    # The materializing branch re-applies the lazy conj/neg bits after the
+    # real-valued copy; both must land in the output, matching native.
+    if dtype == torch.complex32 and "neg" in layout:
+        pytest.skip("complex32 neg_conj is not implemented in native ATen")
+    base = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    inp = _apply_layout(base, layout)
+    ref_inp = utils.to_reference(inp)
+    other = torch.empty(target, dtype=dtype, device=flag_gems.device)
+
+    ref_out = ref_inp.reshape_as(torch.empty(target, dtype=dtype))
+    res_out = flag_gems.reshape_as(inp, other)
+
+    utils.gems_assert_close(res_out.float(), ref_out.float(), torch.float32, atol=1e-2)

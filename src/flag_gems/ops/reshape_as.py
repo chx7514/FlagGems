@@ -82,7 +82,9 @@ def _copy_logical(src: torch.Tensor, dst: torch.Tensor) -> None:
         if src.is_conj():
             conj_physical_(dst)
         if src.is_neg():
-            neg_(dst)
+            # flag_gems ``neg_`` is real-valued only (Triton has no complex
+            # dtype), so negate through the real view.
+            neg_(torch.view_as_real(dst))
     elif src.is_neg():
         # A lazy-neg view keeps the pre-negation values in storage; negate the
         # copied result to recover the logical values.
