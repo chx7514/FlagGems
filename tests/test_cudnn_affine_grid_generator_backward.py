@@ -173,3 +173,44 @@ def test_cudnn_affine_grid_generator_backward_out_non_contiguous(shape, dtype):
     # The untouched gaps of the buffer must not have been written to.
     assert torch.count_nonzero(out_buf[:, :, 1::2]) == 0
     utils.gems_assert_close(out, ref_out, dtype, atol=1e-3)
+
+
+@pytest.mark.cudnn_affine_grid_generator_backward
+@pytest.mark.parametrize(
+    "shape", [(1, 3, 1, 1), (1, 3, 1, 8), (2, 3, 8, 1), (2, 3, 4, 5)]
+)
+@pytest.mark.parametrize("dtype", CUDNN_AFFINE_GRID_BACKWARD_DTYPES)
+def test_cudnn_affine_grid_generator_backward_unit_dim(shape, dtype):
+    """Unit spatial dimensions, checked against cudnn's *forward*, not against
+    its backward.
+
+    For a unit dimension cudnn and native aten disagree: cudnn clamps the
+    align_corners denominator to 1 and places the single sample at -1, while
+    aten's ``affine_grid_generator`` places it at 0. Comparing only against
+    ``cudnn_affine_grid_generator_backward`` cannot detect a kernel that
+    follows the wrong convention, so the reference here is the gradient of
+    cudnn's own forward grid. That keeps the pair self-consistent and pins the
+    convention on an implementation this kernel does not share code with.
+    """
+    if TO_CPU:
+        pytest.skip(
+            "cudnn_affine_grid_generator_backward is CUDA-only, cannot run in quick-cpu mode"
+        )
+
+    N, C, H, W = shape
+    grad = torch.randn((N, H, W, 2), dtype=dtype, device=flag_gems.device)
+    ref_grad = utils.to_reference(grad, True)
+
+    # d/dtheta sum(cudnn_forward(theta) * grad) at theta = identity. The grid
+    # is linear in theta, so the gradient is the constant coefficient of grad.
+    theta = torch.zeros(N, 2, 3, dtype=ref_grad.dtype, device=ref_grad.device)
+    theta[:, 0, 0] = 1.0
+    theta[:, 1, 1] = 1.0
+    theta.requires_grad_(True)
+    grid = torch.ops.aten.cudnn_affine_grid_generator(theta, N, C, H, W)
+    (grid * ref_grad).sum().backward()
+    ref_out = theta.grad.detach()
+
+    res_out = flag_gems.cudnn_affine_grid_generator_backward(grad, N, C, H, W)
+
+    utils.gems_assert_close(res_out, ref_out, dtype, atol=1e-3)

@@ -26,12 +26,15 @@ logger = logging.getLogger(__name__)
 
 # Number of grid samples reduced by a single program of the partial kernel.
 CHUNK_SIZE = 256
+# Direct-path block cap. A 4096-wide block spills ~80 registers (255 regs at
+# the hardware limit); 2048 keeps the six fp32 accumulators resident.
+BLOCK_CAP = 2048
+# Grids whose plane fits in one program avoid the partial buffer entirely.
+SINGLE_PROGRAM_LIMIT = 4096
 # Maximum number of programs along the sample dimension, which bounds the size
 # of the [N, NUM_CHUNKS, NUM_OUTPUTS] partial buffer.
 MAX_CHUNKS = 1024
 NUM_OUTPUTS = 6  # 2 output channels x 3 theta coefficients
-# Above this many samples per batch the reduction is split over several programs.
-SINGLE_PROGRAM_LIMIT = 4096
 
 
 @libentry()
@@ -69,8 +72,11 @@ def _affine_grid_backward_kernel(
         end = tl.minimum(start + CHUNK_LEN, HW)
 
     # Normalized sampling coordinates, matching cudnn's align_corners=True grid.
-    # For a dimension of size 1 the denominator is clamped to 1, i.e. the
-    # coordinate is -1 for the single sample, which is what cudnn does as well.
+    # cudnn differs from aten::affine_grid_generator here: for a unit dimension
+    # it clamps the denominator to 1, so the single sample sits at -1 (native
+    # aten puts it at 0). The forward grid cudnn generates uses the same
+    # clamping, so this kernel and its forward stay consistent with each other.
+    # This operator is the cudnn variant, so cudnn's convention is the contract.
     if IS_FP64:
         coord_dtype = tl.float64
         acc_dtype = tl.float64
@@ -211,8 +217,8 @@ def _cudnn_affine_grid_generator_backward(
     if HW <= SINGLE_PROGRAM_LIMIT:
         # One program per batch element reduces the whole (H, W) plane, so no
         # partial buffer and no second kernel launch are needed. The block is
-        # sized to the plane so that small grids do not pay for idle lanes.
-        block = min(max(triton.next_power_of_2(HW), 128), SINGLE_PROGRAM_LIMIT)
+        # capped below the spill point of the six accumulators.
+        block = min(max(triton.next_power_of_2(HW), 128), BLOCK_CAP)
         _affine_grid_backward_kernel[(N,)](
             grad,
             None,
