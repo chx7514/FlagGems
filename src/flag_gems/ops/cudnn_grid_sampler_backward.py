@@ -39,17 +39,27 @@ The two gradients are then
 
 Both gradients are produced by a single kernel so the input pixels needed by
 ``grad_grid`` are read only once.  ``grad_self`` is accumulated with atomics
-into a float32 (or float64) scratch buffer, which is exact enough for a scatter
-of at most four contributions per output location.
+into a zero-filled float32 (or float64) buffer, which is exact enough for a
+scatter of a handful of contributions per input pixel; when the destination
+already has that dtype the caller's buffer is used directly instead of
+allocating a scratch and copying afterwards.
+
+NaN handling follows cuDNN: a non-finite grid coordinate propagates into the
+``grad_grid`` component whose derivative is multiplied by the corresponding
+bilinear weight, and a non-finite ``grad_output`` only contributes where the
+sample point actually touches the input (a sample taken entirely outside of the
+image contributes nothing, so ``grad_grid`` stays finite there).
 """
 
 import logging
+import warnings
 
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +71,32 @@ logger = logging.getLogger(__name__)
 KERNEL_CONFIG = (16, 4, 4)
 KERNEL_CONFIG_FP64 = (32, 4, 2)
 
+# Flat element offsets are computed in int32 unless one of the tensors is
+# larger than this.  2**31 is the first value an int32 offset cannot hold.
+_INT32_MAX = 2**31
+
+_OUT_RESIZED_WARNING = (
+    "An output with one or more elements was resized since it had shape "
+    "{old_shape}, which does not match the required output shape {new_shape}. "
+    "This behavior is deprecated, and in a future PyTorch release outputs will "
+    "not be resized unless they have zero elements. You can explicitly reuse an "
+    "out tensor t by resizing it, inplace, to zero elements with t.resize_(0)."
+)
+
+
+def _dtype_name(dtype):
+    return str(dtype).removeprefix("torch.")
+
+
+@triton.jit
+def _cast_scalar(value, dtype: tl.constexpr):
+    """Cast a scalar kernel argument.
+
+    Triton specializes integer arguments to Python constants, which have no
+    ``.to()`` method, so ``tl.cast`` is used instead.
+    """
+    return tl.cast(value, dtype)
+
 
 @triton.jit
 def _grid_lookup(
@@ -68,40 +104,45 @@ def _grid_lookup(
     n,
     pos,
     p_mask,
-    total_out,
+    num_out,
     W_in,
     H_in,
     CALC_DTYPE: tl.constexpr,
+    USE_INT64_INDEX: tl.constexpr,
 ):
     """Load grid coordinates and turn them into bilinear corner descriptions."""
-    grid_base = (n * total_out + pos) * 2
+    index_dtype = tl.int64 if USE_INT64_INDEX else tl.int32
+    grid_base = (n * num_out + pos) * 2
     gx = tl.load(grid_ptr + grid_base, mask=p_mask, other=0.0).to(CALC_DTYPE)
     gy = tl.load(grid_ptr + grid_base + 1, mask=p_mask, other=0.0).to(CALC_DTYPE)
 
     # align_corners=True denormalization.
-    px = (gx + 1.0) * (W_in - 1) * 0.5
-    py = (gy + 1.0) * (H_in - 1) * 0.5
+    px = (gx + 1.0) * (_cast_scalar(W_in, CALC_DTYPE) - 1.0) * 0.5
+    py = (gy + 1.0) * (_cast_scalar(H_in, CALC_DTYPE) - 1.0) * 0.5
 
     x0f = tl.floor(px)
     y0f = tl.floor(py)
     wx = px - x0f
     wy = py - y0f
 
-    # Float comparisons keep NaN (and far out-of-range) coordinates invalid
-    # instead of relying on an undefined float -> int conversion.
+    # Bounds are tested in floating point, before casting, so NaN (and far
+    # out-of-range) coordinates never reach an undefined float -> int conversion.
+    # ``W_in``/``H_in`` are loop-invariant integers, so the comparisons promote
+    # them to the coordinate dtype.
     x0_ok = (x0f >= 0) & (x0f < W_in)
     x1_ok = (x0f + 1.0 >= 0) & (x0f + 1.0 < W_in)
     y0_ok = (y0f >= 0) & (y0f < H_in)
     y1_ok = (y0f + 1.0 >= 0) & (y0f + 1.0 < H_in)
 
-    x0 = tl.cast(tl.where(x0_ok, x0f, 0.0), tl.int32)
-    x1 = tl.cast(tl.where(x1_ok, x0f + 1.0, 0.0), tl.int32)
-    y0 = tl.cast(tl.where(y0_ok, y0f, 0.0), tl.int32)
-    y1 = tl.cast(tl.where(y1_ok, y0f + 1.0, 0.0), tl.int32)
+    x0 = tl.cast(tl.where(x0_ok, x0f, 0.0), index_dtype)
+    x1 = tl.cast(tl.where(x1_ok, x0f + 1.0, 0.0), index_dtype)
+    y0 = tl.cast(tl.where(y0_ok, y0f, 0.0), index_dtype)
+    y1 = tl.cast(tl.where(y1_ok, y0f + 1.0, 0.0), index_dtype)
 
     return x0, x1, y0, y1, wx, wy, x0_ok, x1_ok, y0_ok, y1_ok
 
 
+@libentry()
 @triton.jit
 def cudnn_grid_sampler_backward_kernel(
     grad_input_ptr,
@@ -110,22 +151,38 @@ def cudnn_grid_sampler_backward_kernel(
     input_ptr,
     grid_ptr,
     C,
-    total_out,
+    num_out,
     H_in,
     W_in,
+    num_p_blocks,
     BLOCK_P: tl.constexpr,
     BLOCK_C: tl.constexpr,
     CALC_DTYPE: tl.constexpr,
+    USE_INT64_INDEX: tl.constexpr,
 ):
     """Scatter ``grad_input`` and reduce the channels for ``grad_grid``."""
-    pid_p = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    index_dtype = tl.int64 if USE_INT64_INDEX else tl.int32
 
-    pos = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
-    p_mask = pos < total_out
+    pid = tl.program_id(0)
+    # Flattened launch: the position blocks of every batch entry in one
+    # dimension, so neither the batch size nor ``H_out * W_out`` is limited by
+    # the 65535 cap of the y grid dimension.
+    n = (pid // num_p_blocks).to(index_dtype)
+    pid_p = pid % num_p_blocks
+
+    pos = pid_p.to(index_dtype) * BLOCK_P + tl.arange(0, BLOCK_P).to(index_dtype)
+    p_mask = pos < num_out
 
     x0, x1, y0, y1, wx, wy, x0_ok, x1_ok, y0_ok, y1_ok = _grid_lookup(
-        grid_ptr, pid_n, pos, p_mask, total_out, W_in, H_in, CALC_DTYPE
+        grid_ptr,
+        n,
+        pos,
+        p_mask,
+        num_out,
+        W_in,
+        H_in,
+        CALC_DTYPE,
+        USE_INT64_INDEX,
     )
 
     one_minus_wx = 1.0 - wx
@@ -148,16 +205,18 @@ def cudnn_grid_sampler_backward_kernel(
     acc_x = tl.zeros([BLOCK_P], dtype=CALC_DTYPE)
     acc_y = tl.zeros([BLOCK_P], dtype=CALC_DTYPE)
 
-    input_base = pid_n * C * (H_in * W_in)
-    grad_output_base = pid_n * C * total_out
+    hw = _cast_scalar(H_in, index_dtype) * _cast_scalar(W_in, index_dtype)
+    c_total = _cast_scalar(C, index_dtype)
+    input_base = n * c_total * hw
+    grad_output_base = n * c_total * num_out
 
     for c0 in range(0, C, BLOCK_C):
-        cs = c0 + tl.arange(0, BLOCK_C)
-        c_mask = cs < C
+        cs = (c0 + tl.arange(0, BLOCK_C)).to(index_dtype)
+        c_mask = cs < c_total
         tile_mask = c_mask[:, None] & p_mask[None, :]
 
-        input_offset = cs[:, None] * (H_in * W_in)
-        grad_output_offset = cs[:, None] * total_out + pos[None, :]
+        input_offset = cs[:, None] * hw
+        grad_output_offset = cs[:, None] * num_out + pos[None, :]
 
         p00 = tl.load(
             input_ptr + input_base + input_offset + y0_2d * W_in + x0_2d,
@@ -187,7 +246,7 @@ def cudnn_grid_sampler_backward_kernel(
         ).to(CALC_DTYPE)
 
         # grad_input: scatter the bilinear weights of the four corners.
-        grad_input_base = grad_input_ptr + (pid_n * C + cs)[:, None] * (H_in * W_in)
+        grad_input_base = grad_input_ptr + (n * c_total + cs)[:, None] * hw
         tl.atomic_add(
             grad_input_base + y0_2d * W_in + x0_2d,
             go * one_minus_wx_2d * one_minus_wy_2d,
@@ -213,17 +272,24 @@ def cudnn_grid_sampler_backward_kernel(
             sem="relaxed",
         )
 
+        # cuDNN drops sample points that miss the image entirely, so a NaN
+        # ``grad_output`` there must not leak into ``grad_grid``.
+        touched = corner_mask_00 | corner_mask_01 | corner_mask_10 | corner_mask_11
+        go_grid = tl.where(touched[None, :], go, 0.0)
+
         # grad_grid: partial sums over the channels in this tile.
         acc_x += tl.sum(
-            ((p01 - p00) * one_minus_wy_2d + (p11 - p10) * wy_2d) * go, axis=0
+            ((p01 - p00) * one_minus_wy_2d + (p11 - p10) * wy_2d) * go_grid, axis=0
         )
         acc_y += tl.sum(
-            ((p10 - p00) * one_minus_wx_2d + (p11 - p01) * wx_2d) * go, axis=0
+            ((p10 - p00) * one_minus_wx_2d + (p11 - p01) * wx_2d) * go_grid, axis=0
         )
 
-    grid_base = (pid_n * total_out + pos) * 2
-    tl.store(grad_grid_ptr + grid_base, acc_x * (0.5 * (W_in - 1)), mask=p_mask)
-    tl.store(grad_grid_ptr + grid_base + 1, acc_y * (0.5 * (H_in - 1)), mask=p_mask)
+    grid_base = (n * num_out + pos) * 2
+    scale_x = (_cast_scalar(W_in, CALC_DTYPE) - 1.0) * 0.5
+    scale_y = (_cast_scalar(H_in, CALC_DTYPE) - 1.0) * 0.5
+    tl.store(grad_grid_ptr + grid_base, acc_x * scale_x, mask=p_mask)
+    tl.store(grad_grid_ptr + grid_base + 1, acc_y * scale_y, mask=p_mask)
 
 
 def _check_inputs(input, grid, grad_output):
@@ -248,6 +314,42 @@ def _check_inputs(input, grid, grad_output):
             "cudnn_grid_sampler_backward: expected grad_output of shape "
             f"{expected}, but got {tuple(grad_output.shape)}"
         )
+    if grad_output.dtype != input.dtype:
+        raise ValueError(
+            "cudnn_grid_sampler_backward: expected grad_output to have the same "
+            f"dtype as input, but got {_dtype_name(grad_output.dtype)} and "
+            f"{_dtype_name(input.dtype)}"
+        )
+    for name, tensor in (("grid", grid), ("grad_output", grad_output)):
+        if tensor.device != input.device:
+            raise ValueError(
+                f"cudnn_grid_sampler_backward: expected {name} to be on "
+                f"{input.device}, but got {tensor.device}"
+            )
+
+
+def _prepare_out(out, expected_shape, dtype, device, name):
+    """Resize ``out`` the way ATen's ``resize_output`` does, then check it."""
+    if tuple(out.shape) != expected_shape:
+        if out.numel() != 0:
+            warnings.warn(
+                _OUT_RESIZED_WARNING.format(
+                    old_shape=list(out.shape), new_shape=list(expected_shape)
+                ),
+                UserWarning,
+                stacklevel=3,
+            )
+        out.resize_(expected_shape)
+    if out.dtype != dtype:
+        raise ValueError(
+            f"Expected {name} to have dtype {_dtype_name(dtype)}, "
+            f"but got {_dtype_name(out.dtype)} instead"
+        )
+    if out.device != device:
+        raise ValueError(
+            f"Expected {name} to have device {device}, but got {out.device}"
+        )
+    return out
 
 
 def _select_config(is_fp64, C, total_out):
@@ -258,55 +360,124 @@ def _select_config(is_fp64, C, total_out):
     return block_p, block_c, num_warps
 
 
-def cudnn_grid_sampler_backward(input, grid, grad_output):
-    logger.debug("GEMS CUDNN_GRID_SAMPLER_BACKWARD")
+def _needs_int64_index(N, C, H_in, W_in, total_out):
+    """True when any flat element offset of the kernel can exceed int32."""
+    largest = max(
+        N * C * H_in * W_in,  # input / grad_input
+        N * C * total_out,  # grad_output
+        N * total_out * 2,  # grid / grad_grid
+    )
+    return largest >= _INT32_MAX
+
+
+def _run(input, grid, grad_output, out0=None, out1=None):
+    """Shared driver for the base and ``.out`` variants."""
     _check_inputs(input, grid, grad_output)
 
-    input = input.contiguous()
-    grid = grid.contiguous()
-    grad_output = grad_output.contiguous()
+    inp = input.contiguous()
+    grd = grid.contiguous()
+    go = grad_output.contiguous()
 
-    N, C, H_in, W_in = input.shape
-    H_out, W_out = grid.shape[1], grid.shape[2]
+    N, C, H_in, W_in = inp.shape
+    H_out, W_out = grd.shape[1], grd.shape[2]
     total_out = H_out * W_out
 
-    acc_dtype = torch.float64 if input.dtype == torch.float64 else torch.float32
-    triton_acc_dtype = tl.float64 if acc_dtype == torch.float64 else tl.float32
+    input_shape = (N, C, H_in, W_in)
+    grid_shape = (N, H_out, W_out, 2)
+    device = inp.device
 
-    grad_input = torch.zeros((N, C, H_in, W_in), dtype=acc_dtype, device=input.device)
-    grad_grid = torch.empty((N, H_out, W_out, 2), dtype=acc_dtype, device=grid.device)
+    if out0 is not None:
+        out0 = _prepare_out(out0, input_shape, inp.dtype, device, "out0")
+    if out1 is not None:
+        out1 = _prepare_out(out1, grid_shape, grd.dtype, device, "out1")
 
-    if N == 0 or C == 0 or total_out == 0 or H_in == 0 or W_in == 0:
-        return grad_input.to(input.dtype), grad_grid.to(grid.dtype)
+    if N == 0 or C == 0 or H_in == 0 or W_in == 0 or total_out == 0:
+        # No sample point can touch the input: every gradient is zero.
+        grad_input = (
+            out0
+            if out0 is not None
+            else torch.empty(input_shape, dtype=inp.dtype, device=device)
+        )
+        grad_input.zero_()
+        grad_grid = (
+            out1
+            if out1 is not None
+            else torch.empty(grid_shape, dtype=grd.dtype, device=device)
+        )
+        grad_grid.zero_()
+        return grad_input, grad_grid
+
+    # grad_grid is produced by a plain reduction, so the kernel stores straight
+    # into the destination and lets the store perform the dtype conversion.
+    grad_grid = (
+        out1
+        if out1 is not None
+        else torch.empty(grid_shape, dtype=grd.dtype, device=device)
+    )
+    if grad_grid.is_contiguous():
+        kernel_grid = grad_grid
+    else:
+        # A strided destination cannot be addressed with flat offsets, so the
+        # kernel writes a contiguous staging buffer that is copied afterwards.
+        kernel_grid = torch.empty(grid_shape, dtype=grd.dtype, device=device)
+
+    # grad_input is accumulated with atomics, which needs a zero-filled buffer
+    # in the accumulation dtype.  When the destination already has that dtype
+    # (float32/float64 input) the buffer is used directly instead of allocating
+    # a scratch and converting afterwards, which would add a full-size pass.
+    acc_dtype = torch.float64 if inp.dtype == torch.float64 else torch.float32
+    if out0 is not None and out0.dtype == acc_dtype and out0.is_contiguous():
+        grad_input = out0
+        kernel_input = grad_input
+        kernel_input.zero_()
+    elif out0 is None and inp.dtype == acc_dtype:
+        grad_input = torch.zeros(input_shape, dtype=acc_dtype, device=device)
+        kernel_input = grad_input
+    else:
+        kernel_input = torch.zeros(input_shape, dtype=acc_dtype, device=device)
+        grad_input = None
 
     block_p, block_c, num_warps = _select_config(
         acc_dtype == torch.float64, C, total_out
     )
+    num_p_blocks = triton.cdiv(total_out, block_p)
 
-    grid_size = (triton.cdiv(total_out, block_p), N)
-    with torch_device_fn.device(input.device):
-        cudnn_grid_sampler_backward_kernel[grid_size](
-            grad_input,
-            grad_grid,
-            grad_output,
-            input,
-            grid,
+    with torch_device_fn.device(device):
+        cudnn_grid_sampler_backward_kernel[(num_p_blocks * N,)](
+            kernel_input,
+            kernel_grid,
+            go,
+            inp,
+            grd,
             C,
             total_out,
             H_in,
             W_in,
+            num_p_blocks,
             BLOCK_P=block_p,
             BLOCK_C=block_c,
-            CALC_DTYPE=triton_acc_dtype,
+            CALC_DTYPE=tl.float64 if acc_dtype == torch.float64 else tl.float32,
+            USE_INT64_INDEX=_needs_int64_index(N, C, H_in, W_in, total_out),
             num_warps=num_warps,
         )
 
-    return grad_input.to(input.dtype), grad_grid.to(grid.dtype)
+    if grad_input is None:
+        grad_input = (
+            out0
+            if out0 is not None
+            else torch.empty(input_shape, dtype=inp.dtype, device=device)
+        )
+        grad_input.copy_(kernel_input)
+    if kernel_grid is not grad_grid:
+        grad_grid.copy_(kernel_grid)
+    return grad_input, grad_grid
+
+
+def cudnn_grid_sampler_backward(input, grid, grad_output):
+    logger.debug("GEMS CUDNN_GRID_SAMPLER_BACKWARD")
+    return _run(input, grid, grad_output)
 
 
 def cudnn_grid_sampler_backward_out(input, grid, grad_output, out0, out1):
     logger.debug("GEMS CUDNN_GRID_SAMPLER_BACKWARD_OUT")
-    grad_input, grad_grid = cudnn_grid_sampler_backward(input, grid, grad_output)
-    out0.copy_(grad_input)
-    out1.copy_(grad_grid)
-    return out0, out1
+    return _run(input, grid, grad_output, out0=out0, out1=out1)
