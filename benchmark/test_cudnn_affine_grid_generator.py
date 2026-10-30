@@ -53,8 +53,9 @@ def test_cudnn_affine_grid_generator():
     bench = CudnnAffineGridBenchmark(
         op_name="cudnn_affine_grid_generator",
         torch_op=torch.cudnn_affine_grid_generator,
-        # cuDNN computes this operator in float32 internally.
-        dtypes=[torch.float32],
+        # bfloat16 is rejected by cuDNN (CUDNN_STATUS_BAD_PARAM); float16,
+        # float32 and float64 are all accepted.
+        dtypes=[torch.float16, torch.float32, torch.float64],
     )
     bench.run()
 
@@ -72,6 +73,6 @@ def test_cudnn_affine_grid_generator_out():
     bench = CudnnAffineGridOutBenchmark(
         op_name="cudnn_affine_grid_generator_out",
         torch_op=torch.ops.aten.cudnn_affine_grid_generator.out,
-        dtypes=[torch.float32],
+        dtypes=[torch.float16, torch.float32, torch.float64],
     )
     bench.run()

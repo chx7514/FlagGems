@@ -37,12 +37,18 @@ def cudnn_affine_grid_generator_kernel(
     theta_ptr,
     H,
     W,
+    out_s0,
+    out_s1,
+    out_s2,
+    out_s3,
     BLOCK_W: tl.constexpr,
     NEEDS_MASK: tl.constexpr,
+    IS_FP64: tl.constexpr,
+    UNIT_COORD_STRIDE: tl.constexpr,
 ):
-    # grid has shape [N, H, W, 2] (contiguous) and theta has shape [N, 2, 3].
-    # Each program handles BLOCK_W columns of one (n, h) row, so the affine
-    # coefficients are scalars and are loaded exactly once per program.
+    # grid has shape [N, H, W, 2] and theta has shape [N, 2, 3]. Each program
+    # handles BLOCK_W columns of one (n, h) row, so the affine coefficients are
+    # scalars and are loaded exactly once per program.
     row = tle.program_id(0)
     col_block = tle.program_id(1)
     n = row // H
@@ -57,63 +63,102 @@ def cudnn_affine_grid_generator_kernel(
     theta_11 = tl.load(theta_ptr + theta_base + 4)
     theta_12 = tl.load(theta_ptr + theta_base + 5)
 
-    theta_00 = theta_00.to(tl.float32)
-    theta_01 = theta_01.to(tl.float32)
-    theta_02 = theta_02.to(tl.float32)
-    theta_10 = theta_10.to(tl.float32)
-    theta_11 = theta_11.to(tl.float32)
-    theta_12 = theta_12.to(tl.float32)
+    # cuDNN selects cudnnDataType from theta's dtype, so float64 inputs are
+    # computed in float64 and must not be narrowed here. Everything else
+    # (float16 included) is promoted to float32, matching cuDNN.
+    if IS_FP64:
+        theta_00 = theta_00.to(tl.float64)
+        theta_01 = theta_01.to(tl.float64)
+        theta_02 = theta_02.to(tl.float64)
+        theta_10 = theta_10.to(tl.float64)
+        theta_11 = theta_11.to(tl.float64)
+        theta_12 = theta_12.to(tl.float64)
 
     # cuDNN normalizes coordinates in the align_corners=True sense:
     #   coord = 2 * index / (size - 1) - 1
     # Degenerate (size == 1) dimensions collapse to -1.0.
     if H > 1:
-        norm_y = tl.full((), h.to(tl.float32) * (2.0 / (H - 1.0)) - 1.0, tl.float32)
+        scale_y = 2.0 / (H.to(tl.float64) - 1.0) if IS_FP64 else 2.0 / (H - 1.0)
+        norm_y = (h.to(tl.float64) if IS_FP64 else h.to(tl.float32)) * scale_y - 1.0
     else:
-        norm_y = tl.full((), -1.0, tl.float32)
+        norm_y = tl.full((), -1.0, tl.float64 if IS_FP64 else tl.float32)
 
     w = col_block * BLOCK_W + tl.arange(0, BLOCK_W)
     if W > 1:
-        norm_x = w.to(tl.float32) * (2.0 / (W - 1.0)) - 1.0
+        scale_x = 2.0 / (W.to(tl.float64) - 1.0) if IS_FP64 else 2.0 / (W - 1.0)
+        norm_x = (w.to(tl.float64) if IS_FP64 else w.to(tl.float32)) * scale_x - 1.0
     else:
-        norm_x = tl.full((BLOCK_W,), -1.0, tl.float32)
+        norm_x = tl.full((BLOCK_W,), -1.0, tl.float64 if IS_FP64 else tl.float32)
 
     grid_x = theta_00 * norm_x + theta_01 * norm_y + theta_02
     grid_y = theta_10 * norm_x + theta_11 * norm_y + theta_12
 
-    # The output is contiguous, so the (x, y) pair of a column sits next to
-    # each other; interleave both coordinates into a single coalesced store.
+    # `out` may be a non-contiguous view, so addresses are built from its
+    # strides. When the coordinate axis is unit-stride (contiguous, or any
+    # view that only offsets rows) the (x, y) pair of a column sits next to
+    # each other in memory and both are written with one coalesced store;
+    # otherwise each coordinate is stored with its own stride.
     out_dtype = grid_ptr.dtype.element_ty
-    values = tl.reshape(
-        tl.join(grid_x.to(out_dtype), grid_y.to(out_dtype)), (2 * BLOCK_W,)
-    )
+    col_base = n * out_s0 + h * out_s1 + col_block * BLOCK_W * out_s2
+    col_idx = tl.arange(0, BLOCK_W)
+    in_range = col_idx < W - col_block * BLOCK_W
 
-    out_offsets = (row * W + col_block * BLOCK_W) * 2 + tl.arange(0, 2 * BLOCK_W)
-    if NEEDS_MASK:
-        in_range = w < W
-        out_mask = tl.reshape(tl.join(in_range, in_range), (2 * BLOCK_W,))
-        tl.store(grid_ptr + out_offsets, values, mask=out_mask)
+    if UNIT_COORD_STRIDE:
+        values = tl.reshape(
+            tl.join(grid_x.to(out_dtype), grid_y.to(out_dtype)), (2 * BLOCK_W,)
+        )
+        offsets = col_base + tl.arange(0, 2 * BLOCK_W)
+        if NEEDS_MASK:
+            mask = tl.reshape(tl.join(in_range, in_range), (2 * BLOCK_W,))
+            tl.store(grid_ptr + offsets, values, mask=mask)
+        else:
+            tl.store(grid_ptr + offsets, values)
     else:
-        tl.store(grid_ptr + out_offsets, values)
+        offsets = col_base + col_idx * out_s2
+        gx = grid_x.to(out_dtype)
+        gy = grid_y.to(out_dtype)
+        if NEEDS_MASK:
+            tl.store(grid_ptr + offsets, gx, mask=in_range)
+            tl.store(grid_ptr + offsets + out_s3, gy, mask=in_range)
+        else:
+            tl.store(grid_ptr + offsets, gx)
+            tl.store(grid_ptr + offsets + out_s3, gy)
 
 
 def _cudnn_affine_grid_generator_impl(theta, N, C, H, W, out=None):
-    if out is not None and not out.is_contiguous():
-        out.copy_(_cudnn_affine_grid_generator_impl(theta, N, C, H, W))
-        return out
-
-    if out is None:
-        out = torch.empty((N, H, W, 2), dtype=theta.dtype, device=theta.device)
-
-    if out.numel() == 0:
-        return out
-
     assert theta.shape == (N, 2, 3), f"theta must be shape (N, 2, 3), got {theta.shape}"
+
+    out_shape = (N, H, W, 2)
+    if out is None:
+        out = torch.empty(out_shape, dtype=theta.dtype, device=theta.device)
+    else:
+        # ATen's out variant validates dtype/device and resizes shape
+        # mismatches, so mirror that instead of writing past a small buffer.
+        if out.device != theta.device:
+            raise RuntimeError(
+                f"Expected out tensor to have device {theta.device}, "
+                f"but got {out.device} instead"
+            )
+        if out.dtype != theta.dtype:
+            raise RuntimeError(
+                f"Expected out tensor to have dtype {theta.dtype}, "
+                f"but got {out.dtype} instead"
+            )
+        if tuple(out.shape) != out_shape:
+            out.resize_(out_shape)
+
+    numel = N * H * W * 2
+    if numel == 0:
+        return out
+
     if not theta.is_contiguous():
         theta = theta.contiguous()
 
     BLOCK_W = min(MAX_BLOCK_W, triton.next_power_of_2(W))
     grid = (N * H, triton.cdiv(W, BLOCK_W))
+    # `out` may be non-contiguous; the kernel takes its strides so no extra
+    # contiguous staging buffer or `copy_` round trip is needed.
+    out_s0, out_s1, out_s2, out_s3 = out.stride()
 
     with torch_device_fn.device(theta.device):
         cudnn_affine_grid_generator_kernel[grid](
@@ -121,8 +166,14 @@ def _cudnn_affine_grid_generator_impl(theta, N, C, H, W, out=None):
             theta,
             H,
             W,
+            out_s0,
+            out_s1,
+            out_s2,
+            out_s3,
             BLOCK_W=BLOCK_W,
             NEEDS_MASK=(BLOCK_W != W),
+            IS_FP64=(theta.dtype == torch.float64),
+            UNIT_COORD_STRIDE=(out_s2 == 2 and out_s3 == 1),
         )
 
     return out

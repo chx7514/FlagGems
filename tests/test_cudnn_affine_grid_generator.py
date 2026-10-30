@@ -155,3 +155,120 @@ def test_cudnn_affine_grid_generator_non_contiguous(dtype):
     res_out = flag_gems.cudnn_affine_grid_generator(theta, N, C, H, W)
 
     utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.cudnn_affine_grid_generator
+@pytest.mark.parametrize("shape", CUDNN_AFFINE_GRID_SHAPES)
+def test_cudnn_affine_grid_generator_fp64_precision(shape):
+    """float64 must be computed in float64, not narrowed to float32.
+
+    The default ``gems_assert_close`` budget (atol=1e-4) hides the narrowing,
+    so compare against a float64 eager reference with a strict tolerance.
+    """
+    if TO_CPU:
+        pytest.skip(
+            "cudnn_affine_grid_generator is CUDA-only, cannot run in quick-cpu mode"
+        )
+
+    N, H, W, C = shape
+    theta = torch.randn((N, 2, 3), dtype=torch.float64, device=flag_gems.device)
+    ref_out = _reference(theta, N, C, H, W)
+    res_out = flag_gems.cudnn_affine_grid_generator(theta, N, C, H, W)
+
+    assert res_out.dtype == torch.float64
+    # float32 narrowing shows up at ~1e-7; float64 arithmetic stays near 1e-16.
+    torch.testing.assert_close(res_out, ref_out, atol=1e-14, rtol=1e-14)
+
+
+@pytest.mark.cudnn_affine_grid_generator_out
+@pytest.mark.parametrize("dtype", CUDNN_AFFINE_GRID_FLOAT_DTYPES)
+def test_cudnn_affine_grid_generator_out_resizes(dtype):
+    """A wrong-shaped or zero-element `out` is resized, as ATen's out does."""
+    if TO_CPU:
+        pytest.skip(
+            "cudnn_affine_grid_generator is CUDA-only, cannot run in quick-cpu mode"
+        )
+
+    N, C, H, W = 2, 3, 16, 16
+    theta = torch.randn((N, 2, 3), dtype=dtype, device=flag_gems.device)
+    ref_theta = utils.to_reference(theta, True)
+    ref_out = torch.empty((N, H, W, 2), dtype=ref_theta.dtype, device=ref_theta.device)
+    ref_out = torch.ops.aten.cudnn_affine_grid_generator.out(
+        ref_theta, N, C, H, W, out=ref_out
+    )
+
+    for out in (
+        torch.empty(0, dtype=dtype, device=flag_gems.device),
+        torch.empty((N, H, W, 2), dtype=dtype, device=flag_gems.device)[..., :1],
+    ):
+        res_out = flag_gems.cudnn_affine_grid_generator_out(theta, N, C, H, W, out=out)
+        assert res_out.shape == (N, H, W, 2)
+        assert res_out.data_ptr() == out.data_ptr()
+        utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.cudnn_affine_grid_generator_out
+@pytest.mark.parametrize("dtype", CUDNN_AFFINE_GRID_FLOAT_DTYPES)
+def test_cudnn_affine_grid_generator_out_non_contiguous(dtype):
+    """A non-contiguous `out` is written in place, not copied through."""
+    if TO_CPU:
+        pytest.skip(
+            "cudnn_affine_grid_generator is CUDA-only, cannot run in quick-cpu mode"
+        )
+
+    N, C, H, W = 2, 3, 16, 16
+    theta = torch.randn((N, 2, 3), dtype=dtype, device=flag_gems.device)
+    ref_theta = utils.to_reference(theta, True)
+    ref_out = torch.empty((N, H, W, 2), dtype=ref_theta.dtype, device=ref_theta.device)
+    ref_out = torch.ops.aten.cudnn_affine_grid_generator.out(
+        ref_theta, N, C, H, W, out=ref_out
+    )
+
+    # Wider backing buffer sliced to [..., :2]: the elements after the view
+    # must not be touched, which catches an offset computed from a contiguous
+    # layout instead of `out`'s strides.
+    backing = torch.zeros((N, H, W, 4), dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.cudnn_affine_grid_generator_out(
+        theta, N, C, H, W, out=backing[..., :2]
+    )
+    assert res_out.data_ptr() == backing[..., :2].data_ptr()
+    utils.gems_assert_close(res_out, ref_out, dtype)
+    assert torch.count_nonzero(backing[..., 2:]) == 0
+
+    # Transposed view: neither axis is unit-stride, so both coordinates are
+    # stored with out's own strides.
+    transposed = torch.zeros((N, 2, W, H), dtype=dtype, device=flag_gems.device)
+    res_out = flag_gems.cudnn_affine_grid_generator_out(
+        theta, N, C, H, W, out=transposed.transpose(1, 3)
+    )
+    assert res_out.data_ptr() == transposed.data_ptr()
+    utils.gems_assert_close(res_out, ref_out, dtype)
+
+
+@pytest.mark.cudnn_affine_grid_generator_out
+@pytest.mark.parametrize("dtype", CUDNN_AFFINE_GRID_FLOAT_DTYPES)
+def test_cudnn_affine_grid_generator_out_rejects(dtype):
+    """out must match theta's dtype and device, like ATen."""
+    if TO_CPU:
+        pytest.skip(
+            "cudnn_affine_grid_generator is CUDA-only, cannot run in quick-cpu mode"
+        )
+
+    N, C, H, W = 2, 3, 4, 5
+    theta = torch.randn((N, 2, 3), dtype=dtype, device=flag_gems.device)
+
+    other_dtype = torch.float16 if dtype != torch.float16 else torch.float32
+    with pytest.raises(RuntimeError):
+        flag_gems.cudnn_affine_grid_generator_out(
+            theta,
+            N,
+            C,
+            H,
+            W,
+            out=torch.empty((N, H, W, 2), dtype=other_dtype, device=flag_gems.device),
+        )
+
+    with pytest.raises(RuntimeError):
+        flag_gems.cudnn_affine_grid_generator_out(
+            theta, N, C, H, W, out=torch.empty((N, H, W, 2), dtype=dtype)
+        )
